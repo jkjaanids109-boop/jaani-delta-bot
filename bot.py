@@ -92,10 +92,12 @@ def send_tg_photo(photo_path: str, caption: str):
         with open(photo_path, "rb") as f:
             r = requests.post(
                 url,
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "Markdown"},
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1020], "parse_mode": "Markdown"},
                 files={"photo": f},
                 timeout=25
             ).json()
+        if not r.get("ok"):
+            print("TG Photo Response:", r)
         if os.path.exists(photo_path):
             os.remove(photo_path)
         return r.get("result", {}).get("message_id")
@@ -343,7 +345,7 @@ def evaluate_trade(analysis: dict, df_15m, funding_rate: float) -> dict:
         "approved": True, "side": side, "mode": analysis["mode"], "pattern": analysis["pattern"],
         "entry": round(entry, 1), "sl": sl, "tp1": tp1, "tp2": tp2, "net_rr": net_rr,
         "lots": lots, "risk_inr": RISK_PER_TRADE_INR, "obstacle_warning": obs_warn,
-        "funding_rate_pct": round(funding_rate * 100, 4), "funding_warn": funding_warn,
+        "funding_rate_pct": round(funding_rate, 4), "funding_warn": funding_warn,
         "tp1_hit": False
     }
 
@@ -412,25 +414,27 @@ def get_atm_options_note(spot_price: float) -> str:
         return "📊 **BTC ATM Options:** डेटा अभी उपलब्ध नहीं।"
 
 
-def send_manual_status(curr_price: float, fr: float, analysis: dict, reason: str):
-    """मैन्युअल Run workflow दबाने पर तुरंत टेस्ट और लाइव मार्केट अपडेट।"""
-    opt_note = get_atm_options_note(curr_price)
-    ema_pos = "1H 20-EMA के ऊपर (UP)" if analysis["trend_1h"] == "UP" else "1H 20-EMA के नीचे (DOWN)"
-    now_ist = datetime.datetime.now(IST).strftime("%d-%b %I:%M %p IST")
-    msg = (
-        f"✅ **बॉट लाइव और कनेक्टेड है — BTCUSD**\n"
-        f"🕒 समय: `{now_ist}`\n"
-        f"💰 **लाइव प्राइस:** `${curr_price:,.1f}`\n"
-        f"📈 **ट्रेंड (1H):** {ema_pos}\n"
-        f"📊 **15M RSI:** `{analysis['rsi_15m']}` | **वॉल्यूम:** `{analysis['vol_ratio']}x`\n"
-        f"📌 **Weekly VWAP:** `${analysis['vwap']:,.1f}` | **Funding:** `{round(fr * 100, 4)}%`\n"
-        f"🔍 **स्टेटस:** {reason}\n\n"
-        f"{opt_note}"
+def create_status_chart(df_15m, curr_price: float, rsi_val: float, vwap_val: float, filename="status_chart.png") -> str:
+    """मैन्युअल अपडेट के लिए 15M लाइव चार्ट इमेज।"""
+    plot_df = df_15m.tail(60).copy().set_index("datetime")
+    hlines = [curr_price]
+    colors = ["#2962FF"]
+    if abs(vwap_val - curr_price) / curr_price <= 0.05:
+        hlines.append(vwap_val)
+        colors.append("#FF9800")
+
+    style = mpf.make_mpf_style(base_mpf_style="nightclouds", gridstyle=":", y_on_right=True)
+    mpf.plot(
+        plot_df, type="candle", volume=True, style=style,
+        title=f"BTCUSD 15M Live | Price: ${curr_price:,.1f} | RSI: {rsi_val}",
+        hlines=dict(hlines=hlines, colors=colors, linestyle="--", linewidths=1.3),
+        savefig=dict(fname=filename, dpi=130, bbox_inches="tight")
     )
-    send_tg_message(msg)
+    return filename
 
 
 def create_15m_chart(df_15m, trade: dict, vwap_val: float, filename="signal_chart.png") -> str:
+    """पक्का BUY/SELL सिग्नल आने पर Entry/SL/TP लाइनों के साथ 15M चार्ट।"""
     plot_df = df_15m.tail(60).copy().set_index("datetime")
     hlines = [trade["entry"], trade["sl"], trade["tp1"], trade["tp2"]]
     colors = ["#2962FF", "#F23645", "#089981", "#00E676"]
@@ -446,6 +450,25 @@ def create_15m_chart(df_15m, trade: dict, vwap_val: float, filename="signal_char
         savefig=dict(fname=filename, dpi=130, bbox_inches="tight")
     )
     return filename
+
+
+def send_manual_status(df_15m, curr_price: float, fr: float, analysis: dict, reason: str):
+    """मैन्युअल Run workflow दबाने पर 15M चार्ट फोटो + लाइव अपडेट।"""
+    opt_note = get_atm_options_note(curr_price)
+    ema_pos = "1H 20-EMA के ऊपर (UP)" if analysis["trend_1h"] == "UP" else "1H 20-EMA के नीचे (DOWN)"
+    now_ist = datetime.datetime.now(IST).strftime("%d-%b %I:%M %p IST")
+    msg = (
+        f"✅ **बॉट लाइव और कनेक्टेड है — BTCUSD**\n"
+        f"🕒 समय: `{now_ist}`\n"
+        f"💰 **लाइव प्राइस:** `${curr_price:,.1f}`\n"
+        f"📈 **ट्रेंड (1H):** {ema_pos}\n"
+        f"📊 **15M RSI:** `{analysis['rsi_15m']}` | **वॉल्यूम:** `{analysis['vol_ratio']}x`\n"
+        f"📌 **Weekly VWAP:** `${analysis['vwap']:,.1f}` | **Funding:** `{round(fr, 4)}%`\n"
+        f"🔍 **स्टेटस:** {reason}\n\n"
+        f"{opt_note}"
+    )
+    chart_file = create_status_chart(df_15m, curr_price, analysis["rsi_15m"], analysis["vwap"])
+    send_tg_photo(chart_file, msg)
 
 
 # ==============================================================================
@@ -523,7 +546,7 @@ def main():
     if latest_ts <= st["last_candle_ts"]:
         if is_manual:
             analysis = analyze_market(data)
-            send_manual_status(curr_price, fr, analysis, "अभी कोई पक्का सेटअप नहीं बना है (24/7 स्कैनिंग चालू है)।")
+            send_manual_status(data["15m"], curr_price, fr, analysis, "अभी कोई पक्का सेटअप नहीं बना है (24/7 स्कैनिंग चालू है)।")
         print("Same candle already scanned.")
         return
 
@@ -532,7 +555,7 @@ def main():
 
     if analysis["signal"] == "WAIT":
         if is_manual:
-            send_manual_status(curr_price, fr, analysis, "अभी कोई पक्का सेटअप नहीं बना है (24/7 स्कैनिंग चालू है)।")
+            send_manual_status(data["15m"], curr_price, fr, analysis, "अभी कोई पक्का सेटअप नहीं बना है (24/7 स्कैनिंग चालू है)।")
         print("No setup found. Staying quiet.")
         save_state(st)
         return
@@ -540,7 +563,7 @@ def main():
     trade = evaluate_trade(analysis, data["15m"], fr)
     if not trade["approved"]:
         if is_manual:
-            send_manual_status(curr_price, fr, analysis, "सेटअप बना था, लेकिन Risk/Reward या HTF रेज़िस्टेंस फ़िल्टर ने रोक दिया।")
+            send_manual_status(data["15m"], curr_price, fr, analysis, "सेटअप बना था, लेकिन Risk/Reward या HTF रेज़िस्टेंस फ़िल्टर ने रोक दिया।")
         print("Trade rejected by Risk/Obstacle filter.")
         save_state(st)
         return
