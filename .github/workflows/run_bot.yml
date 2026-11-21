@@ -21,7 +21,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Dependencies
-        run: pip install requests pandas numpy mplfinance pytz six pillow imageio imageio-ffmpeg edge-tts
+        run: pip install requests pandas numpy mplfinance pytz six pillow imageio imageio-ffmpeg edge-tts gTTS
 
       - name: Run BTC Trading Bot
         env:
