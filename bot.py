@@ -412,6 +412,24 @@ def get_atm_options_note(spot_price: float) -> str:
         return "📊 **BTC ATM Options:** डेटा अभी उपलब्ध नहीं।"
 
 
+def send_manual_status(curr_price: float, fr: float, analysis: dict, reason: str):
+    """मैन्युअल Run workflow दबाने पर तुरंत टेस्ट और लाइव मार्केट अपडेट।"""
+    opt_note = get_atm_options_note(curr_price)
+    ema_pos = "1H 20-EMA के ऊपर (UP)" if analysis["trend_1h"] == "UP" else "1H 20-EMA के नीचे (DOWN)"
+    now_ist = datetime.datetime.now(IST).strftime("%d-%b %I:%M %p IST")
+    msg = (
+        f"✅ **बॉट लाइव और कनेक्टेड है — BTCUSD**\n"
+        f"🕒 समय: `{now_ist}`\n"
+        f"💰 **लाइव प्राइस:** `${curr_price:,.1f}`\n"
+        f"📈 **ट्रेंड (1H):** {ema_pos}\n"
+        f"📊 **15M RSI:** `{analysis['rsi_15m']}` | **वॉल्यूम:** `{analysis['vol_ratio']}x`\n"
+        f"📌 **Weekly VWAP:** `${analysis['vwap']:,.1f}` | **Funding:** `{round(fr * 100, 4)}%`\n"
+        f"🔍 **स्टेटस:** {reason}\n\n"
+        f"{opt_note}"
+    )
+    send_tg_message(msg)
+
+
 def create_15m_chart(df_15m, trade: dict, vwap_val: float, filename="signal_chart.png") -> str:
     plot_df = df_15m.tail(60).copy().set_index("datetime")
     hlines = [trade["entry"], trade["sl"], trade["tp1"], trade["tp2"]]
@@ -434,6 +452,7 @@ def create_15m_chart(df_15m, trade: dict, vwap_val: float, filename="signal_char
 # 6. मुख्य 24/7 One-Shot रनर (Cooldown = 0)
 # ==============================================================================
 def main():
+    is_manual = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch"
     st = load_state()
     ltp, mark, fr = get_live_ticker()
     if not ltp:
@@ -489,7 +508,7 @@ def main():
         )
         return
 
-    # --- अवस्था 2: नया 15M मार्केट स्कैन (कोई स्पैम नहीं) ---
+    # --- अवस्था 2: नया 15M मार्केट स्कैन (ऑटो रन पर कोई स्पैम नहीं) ---
     data = {
         "1d": fetch_candles("1d", 500),
         "4h": fetch_candles("4h", 350),
@@ -502,6 +521,9 @@ def main():
 
     latest_ts = int(data["15m"]["time"].iloc[-1])
     if latest_ts <= st["last_candle_ts"]:
+        if is_manual:
+            analysis = analyze_market(data)
+            send_manual_status(curr_price, fr, analysis, "अभी कोई पक्का सेटअप नहीं बना है (24/7 स्कैनिंग चालू है)।")
         print("Same candle already scanned.")
         return
 
@@ -509,12 +531,16 @@ def main():
     analysis = analyze_market(data)
 
     if analysis["signal"] == "WAIT":
+        if is_manual:
+            send_manual_status(curr_price, fr, analysis, "अभी कोई पक्का सेटअप नहीं बना है (24/7 स्कैनिंग चालू है)।")
         print("No setup found. Staying quiet.")
         save_state(st)
         return
 
     trade = evaluate_trade(analysis, data["15m"], fr)
     if not trade["approved"]:
+        if is_manual:
+            send_manual_status(curr_price, fr, analysis, "सेटअप बना था, लेकिन Risk/Reward या HTF रेज़िस्टेंस फ़िल्टर ने रोक दिया।")
         print("Trade rejected by Risk/Obstacle filter.")
         save_state(st)
         return
