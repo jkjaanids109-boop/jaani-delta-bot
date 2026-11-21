@@ -13,10 +13,12 @@ matplotlib.use("Agg")
 import mplfinance as mpf
 from PIL import Image, ImageDraw, ImageFont
 import imageio.v2 as imageio
+import imageio_ffmpeg
 import edge_tts
+from gtts import gTTS
 
 # ==============================================================================
-# 1. कॉन्फ़िगरेशन (GitHub Secrets से सीधे नाम मैच किए गए हैं)
+# 1. कॉन्फ़िगरेशन
 # ==============================================================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -24,7 +26,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 REST_BASE_URL = "https://api.india.delta.exchange"
 SYMBOL = "BTCUSD"
 
-PAPER_MODE = True                 # शुरुआती 7-10 दिन टेस्टिंग के लिए True
+PAPER_MODE = True                 # शुरुआती टेस्टिंग के लिए True
 RISK_PER_TRADE_INR = 500.0        # प्रति ट्रेड फिक्स्ड रिस्क (₹500)
 USD_TO_INR = 85.0                 # Delta India फिक्स्ड कन्वर्ज़न
 LOT_SIZE_BTC = 0.001              # 1 Lot = 0.001 BTC
@@ -70,7 +72,7 @@ def save_state(st: dict):
 
 
 # ==============================================================================
-# 3. टेलीग्राम अलर्ट (Text + Photo + 9:16 Reels Video with Voice)
+# 3. टेलीग्राम अलर्ट (Text + Photo + 9:16 Reels Video)
 # ==============================================================================
 def send_tg_message(text: str, reply_to: int = None):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -444,7 +446,7 @@ def get_atm_options_note(spot_price: float) -> str:
 
 
 # ==============================================================================
-# 6. ग्रीन/रेड चार्ट (IST) + 9:16 एनिमेटेड Instagram Reel वीडियो (हिंदी AI वॉइस सहित)
+# 6. 2D एनीमे गर्ल अवतार + 9:16 Reels वीडियो + पक्की हिंदी महिला आवाज़
 # ==============================================================================
 def get_chart_style():
     mc = mpf.make_marketcolors(
@@ -493,18 +495,90 @@ def load_font(size: int, bold: bool = True):
     return ImageFont.load_default()
 
 
-def build_reel_frame(chart_img_path: str, action: str, curr_price: float, analysis: dict, trade=None, step_pct: float = 1.0) -> np.ndarray:
-    """720x1280 (9:16 Instagram Reels) का प्रोफेशनल डार्क ट्रेडिंग कार्ड।"""
+def draw_anime_girl_avatar(size: int = 230, mouth_state: int = 0, blink: bool = False, accent=(56, 189, 248)) -> Image.Image:
+    """हाई-रेज़ोल्यूशन (2x) 2D एनीमे ट्रेडर गर्ल अवतार (बोलता हुआ मुँह + झपकती आँखें)।"""
+    S = size * 2
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    # गोलाकार ग्लोइंग फ्रेम
+    d.ellipse([(10, 10), (S - 10, S - 10)], fill=(18, 28, 52, 255), outline=accent + (255,), width=10)
+
+    # पीछे के लंबे एनीमे बाल
+    hair_dark = (32, 24, 62, 255)
+    hair_hi = (68, 48, 128, 255)
+    d.ellipse([(S * 0.16, S * 0.12), (S * 0.84, S * 0.88)], fill=hair_dark)
+
+    # ट्रेडर हुडी / कंधे
+    d.chord([(S * 0.14, S * 0.68), (S * 0.86, S * 1.12)], 180, 360, fill=(28, 37, 65, 255), outline=accent + (255,), width=5)
+    d.polygon([(S * 0.42, S * 0.72), (S * 0.58, S * 0.72), (S * 0.50, S * 0.86)], fill=(255, 214, 186, 255))
+
+    # गर्दन और चेहरा
+    skin = (255, 218, 192, 255)
+    d.rectangle([(S * 0.44, S * 0.62), (S * 0.56, S * 0.75)], fill=(242, 196, 168, 255))
+    d.ellipse([(S * 0.28, S * 0.23), (S * 0.72, S * 0.69)], fill=skin)
+
+    # हेडफ़ोन बैंड और ईयरकप
+    d.arc([(S * 0.18, S * 0.13), (S * 0.82, S * 0.72)], 185, 355, fill=(45, 55, 78, 255), width=16)
+    d.rounded_rectangle([(S * 0.16, S * 0.38), (S * 0.28, S * 0.57)], radius=18, fill=(30, 41, 59, 255), outline=accent + (255,), width=5)
+    d.rounded_rectangle([(S * 0.72, S * 0.38), (S * 0.84, S * 0.57)], radius=18, fill=(30, 41, 59, 255), outline=accent + (255,), width=5)
+
+    # सामने की जुल्फ़ें (Anime Bangs)
+    d.polygon([(S * 0.24, S * 0.38), (S * 0.35, S * 0.19), (S * 0.50, S * 0.17), (S * 0.65, S * 0.19), (S * 0.76, S * 0.38),
+               (S * 0.66, S * 0.31), (S * 0.57, S * 0.39), (S * 0.49, S * 0.29), (S * 0.40, S * 0.39), (S * 0.33, S * 0.31)], fill=hair_dark)
+    d.arc([(S * 0.30, S * 0.20), (S * 0.70, S * 0.34)], 200, 340, fill=hair_hi, width=6)
+
+    # आँखें (Anime Eyes / Blink)
+    if blink:
+        d.arc([(S * 0.34, S * 0.45), (S * 0.45, S * 0.51)], 190, 350, fill=(25, 20, 40, 255), width=6)
+        d.arc([(S * 0.55, S * 0.45), (S * 0.66, S * 0.51)], 190, 350, fill=(25, 20, 40, 255), width=6)
+    else:
+        for ex in [0.395, 0.605]:
+            cx, cy = S * ex, S * 0.475
+            d.ellipse([(cx - 24, cy - 22), (cx + 24, cy + 22)], fill=(255, 255, 255, 255))
+            d.ellipse([(cx - 17, cy - 17), (cx + 17, cy + 17)], fill=accent + (255,))
+            d.ellipse([(cx - 10, cy - 10), (cx + 10, cy + 10)], fill=(20, 20, 45, 255))
+            d.ellipse([(cx - 10, cy - 13), (cx - 1, cy - 4)], fill=(255, 255, 255, 255))
+            d.ellipse([(cx + 4, cy + 4), (cx + 10, cy + 10)], fill=(255, 255, 255, 255))
+            d.arc([(cx - 26, cy - 26), (cx + 26, cy + 10)], 200, 340, fill=(25, 20, 40, 255), width=7)
+
+    # गालों पर हल्का गुलाबी ब्लश और नाक
+    d.ellipse([(S * 0.31, S * 0.52), (S * 0.38, S * 0.56)], fill=(255, 145, 165, 140))
+    d.ellipse([(S * 0.62, S * 0.52), (S * 0.69, S * 0.56)], fill=(255, 145, 165, 140))
+    d.ellipse([(S * 0.493, S * 0.53), (S * 0.507, S * 0.545)], fill=(210, 155, 130, 255))
+
+    # बोलता हुआ मुँह (Lip-Sync Animation)
+    if mouth_state == 0:
+        d.arc([(S * 0.45, S * 0.56), (S * 0.55, S * 0.62)], 15, 165, fill=(180, 60, 85, 255), width=6)
+    elif mouth_state == 1:
+        d.ellipse([(S * 0.46, S * 0.575), (S * 0.54, S * 0.618)], fill=(195, 55, 85, 255), outline=(120, 30, 50, 255), width=3)
+    else:
+        d.ellipse([(S * 0.45, S * 0.568), (S * 0.55, S * 0.635)], fill=(175, 40, 70, 255), outline=(110, 25, 45, 255), width=3)
+        d.chord([(S * 0.465, S * 0.595), (S * 0.535, S * 0.632)], 180, 360, fill=(255, 130, 150, 255))
+
+    # हेडफ़ोन माइक
+    d.line([(S * 0.22, S * 0.54), (S * 0.38, S * 0.62)], fill=(148, 163, 184, 255), width=6)
+    d.ellipse([(S * 0.36, S * 0.60), (S * 0.41, S * 0.64)], fill=accent + (255,))
+
+    # गोलाकार मास्क ताकि बाहर कुछ न निकले
+    mask = Image.new("L", (S, S), 0)
+    ImageDraw.Draw(mask).ellipse([(10, 10), (S - 10, S - 10)], fill=255)
+    out = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    out.paste(img, (0, 0), mask)
+    return out.resize((size, size), Image.Resampling.LANCZOS)
+
+
+def build_reel_frame(chart_im: Image.Image, action: str, curr_price: float, analysis: dict,
+                     trade=None, step_pct: float = 1.0, mouth_state: int = 0, blink: bool = False) -> np.ndarray:
     W, H = 720, 1280
     canvas = Image.new("RGB", (W, H), (11, 17, 32))
     draw = ImageDraw.Draw(canvas)
 
-    f_title = load_font(40, True)
-    f_badge = load_font(46, True)
-    f_med = load_font(30, True)
-    f_small = load_font(24, False)
+    f_title = load_font(38, True)
+    f_badge = load_font(44, True)
+    f_med = load_font(27, True)
+    f_small = load_font(22, False)
 
-    # रंग और बैज सेटअप
     if action == "BUY":
         badge_bg, badge_txt = (0, 180, 95), "SIGNAL: BUY NOW"
     elif action == "SELL":
@@ -513,69 +587,91 @@ def build_reel_frame(chart_img_path: str, action: str, curr_price: float, analys
         badge_bg, badge_txt = (230, 145, 10), "DECISION: WAIT"
 
     # टॉप हेडर
-    draw.rectangle([(0, 0), (W, 130)], fill=(18, 28, 50))
-    draw.text((40, 26), "BTCUSD LIVE ANALYSIS", font=f_title, fill=(255, 255, 255))
+    draw.rectangle([(0, 0), (W, 125)], fill=(18, 28, 50))
+    draw.text((38, 24), "BTCUSD LIVE ANALYSIS", font=f_title, fill=(255, 255, 255))
     now_str = datetime.datetime.now(IST).strftime("%d %b | %I:%M %p IST")
-    draw.text((40, 82), f"Delta Exchange India  •  {now_str}", font=f_small, fill=(148, 163, 184))
+    draw.text((38, 78), f"Delta Exchange India  •  {now_str}", font=f_small, fill=(148, 163, 184))
 
     # बड़ा BUY / SELL / WAIT बैज
-    draw.rounded_rectangle([(40, 155), (W - 40, 245)], radius=20, fill=badge_bg)
+    draw.rounded_rectangle([(38, 148), (W - 38, 236)], radius=20, fill=badge_bg)
     bbox = draw.textbbox((0, 0), badge_txt, font=f_badge)
-    tw = bbox[2] - bbox[0]
-    draw.text(((W - tw) // 2, 172), badge_txt, font=f_badge, fill=(255, 255, 255))
+    draw.text(((W - (bbox[2] - bbox[0])) // 2, 165), badge_txt, font=f_badge, fill=(255, 255, 255))
 
     # बीच में एनिमेटेड 15M चार्ट
-    chart_im = Image.open(chart_img_path).convert("RGB")
-    chart_im.thumbnail((W - 40, 540), Image.Resampling.LANCZOS)
     cx = (W - chart_im.width) // 2
-    cy = 275 + (540 - chart_im.height) // 2
+    cy = 262 + (510 - chart_im.height) // 2
     canvas.paste(chart_im, (cx, cy))
 
-    # प्रोग्रेस बार (एनीमेशन का फील देने के लिए)
-    bar_w = int((W - 80) * min(1.0, max(0.05, step_pct)))
-    draw.rounded_rectangle([(40, 835), (W - 40, 847)], radius=6, fill=(30, 41, 59))
-    draw.rounded_rectangle([(40, 835), (40 + bar_w, 847)], radius=6, fill=badge_bg)
+    # प्रोग्रेस बार
+    bar_w = int((W - 76) * min(1.0, max(0.05, step_pct)))
+    draw.rounded_rectangle([(38, 792), (W - 38, 804)], radius=6, fill=(30, 41, 59))
+    draw.rounded_rectangle([(38, 792), (38 + bar_w, 804)], radius=6, fill=badge_bg)
 
-    # नीचे का इन्फो कार्ड
-    draw.rounded_rectangle([(40, 875), (W - 40, 1185)], radius=22, fill=(18, 28, 50), outline=(51, 65, 85), width=2)
+    # नीचे का इन्फो कार्ड + दाईं तरफ़ 2D एनीमे गर्ल अवतार
+    draw.rounded_rectangle([(38, 830), (W - 38, 1185)], radius=22, fill=(18, 28, 50), outline=(51, 65, 85), width=2)
 
     if trade:
         lines = [
-            (f"ENTRY :  ${trade['entry']:,.1f}", (56, 189, 248)),
-            (f"STOP LOSS :  ${trade['sl']:,.1f}", (248, 113, 113)),
-            (f"TARGET 1 :  ${trade['tp1']:,.1f}", (74, 222, 128)),
-            (f"TARGET 2 :  ${trade['tp2']:,.1f}", (0, 230, 118)),
-            (f"RISK: Rs.500  |  LOTS: {trade['lots']}  |  R:R 1:{trade['net_rr']}", (250, 204, 21)),
+            (f"ENTRY: ${trade['entry']:,.1f}", (56, 189, 248)),
+            (f"SL: ${trade['sl']:,.1f}", (248, 113, 113)),
+            (f"TP1: ${trade['tp1']:,.1f}", (74, 222, 128)),
+            (f"TP2: ${trade['tp2']:,.1f}", (0, 230, 118)),
+            (f"LOTS: {trade['lots']} | R:R 1:{trade['net_rr']}", (250, 204, 21)),
         ]
     else:
         lines = [
-            (f"LIVE PRICE :  ${curr_price:,.1f}", (56, 189, 248)),
-            (f"TREND :  1D {analysis['trend_1d']}  |  4H {analysis['trend_4h']}  |  1H {analysis['trend_1h']}", (248, 250, 252)),
-            (f"15M RSI :  {analysis['rsi_15m']}   |   VOL :  {analysis['vol_ratio']}x", (250, 204, 21)),
-            (f"WEEKLY VWAP :  ${analysis['vwap']:,.1f}", (251, 146, 60)),
-            ("NO TRADE ZONE — WAITING FOR SETUP", (148, 163, 184)),
+            (f"PRICE: ${curr_price:,.1f}", (56, 189, 248)),
+            (f"1D:{analysis['trend_1d']} | 4H:{analysis['trend_4h']}", (248, 250, 252)),
+            (f"1H TREND: {analysis['trend_1h']}", (248, 250, 252)),
+            (f"RSI: {analysis['rsi_15m']} | VOL: {analysis['vol_ratio']}x", (250, 204, 21)),
+            (f"VWAP: ${analysis['vwap']:,.0f}", (251, 146, 60)),
         ]
 
-    y_pos = 905
+    y_pos = 865
     for txt, col in lines:
-        draw.text((70, y_pos), txt, font=f_med if y_pos < 1100 else f_small, fill=col)
-        y_pos += 54
+        draw.text((62, y_pos), txt, font=f_med, fill=col)
+        y_pos += 58
+
+    # 2D एनीमे ट्रेडर गर्ल पेस्ट करें
+    girl = draw_anime_girl_avatar(size=220, mouth_state=mouth_state, blink=blink, accent=badge_bg)
+    canvas.paste(girl, (W - 275, 895), girl)
 
     # फ़ुटर ब्रांडिंग
     footer = "JAANI 24x7 AUTO TRADING BOT"
     fb = draw.textbbox((0, 0), footer, font=f_small)
-    draw.text(((W - (fb[2] - fb[0])) // 2, 1215), footer, font=f_small, fill=(100, 116, 139))
+    draw.text(((W - (fb[2] - fb[0])) // 2, 1212), footer, font=f_small, fill=(100, 116, 139))
 
     return np.array(canvas)
 
 
-async def _make_hindi_voice(script: str, out_mp3: str):
-    comm = edge_tts.Communicate(script, voice="hi-IN-MadhurNeural", rate="+6%")
+async def _edge_tts_save(script: str, out_mp3: str):
+    comm = edge_tts.Communicate(script, voice="hi-IN-SwaraNeural", rate="+5%")
     await comm.save(out_mp3)
 
 
+def generate_female_hindi_voice(script: str, out_mp3: str) -> bool:
+    """लड़की की हिंदी आवाज़ (पहले Swara edge-tts, फिर पक्का gTTS बैकअप)।"""
+    try:
+        asyncio.run(_edge_tts_save(script, out_mp3))
+        if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 2000:
+            print("Voice generated via edge-tts (Swara Female).")
+            return True
+    except Exception as e:
+        print("edge-tts failed, switching to gTTS backup:", e)
+
+    try:
+        tts = gTTS(text=script, lang="hi", slow=False)
+        tts.save(out_mp3)
+        if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 2000:
+            print("Voice generated via gTTS (Hindi Female).")
+            return True
+    except Exception as e:
+        print("gTTS backup also failed:", e)
+    return False
+
+
 def create_animated_reel_with_voice(df_15m: pd.DataFrame, curr_price: float, analysis: dict, trade=None, out_mp4="btc_reel.mp4") -> str:
-    """9:16 एनिमेटेड कैंडल वीडियो + असली हिंदी AI वॉइसओवर (Instagram Reels Ready)।"""
+    """9:16 एनिमेटेड कैंडल + बोलती हुई 2D एनीमे गर्ल + पक्की हिंदी महिला आवाज़।"""
     raw_mp4 = "raw_anim.mp4"
     voice_mp3 = "voice_hi.mp3"
     tmp_png = "anim_step.png"
@@ -584,84 +680,99 @@ def create_animated_reel_with_voice(df_15m: pd.DataFrame, curr_price: float, ana
         action = trade["side"] if trade else "WAIT"
         full_df = df_15m.tail(45).reset_index(drop=True)
 
-        # हिंदी वॉइसओवर स्क्रिप्ट
         p_int = int(round(curr_price))
         if trade:
             side_word = "खरीदने यानी बाय" if trade["side"] == "BUY" else "बेचने यानी सेल"
             script = (
-                f"नमस्कार ट्रेडर्स! बिटकॉइन में पक्का {side_word} का सिग्नल बना है। "
+                f"नमस्ते ट्रेडर्स! बिटकॉइन में पक्का {side_word} का सिग्नल बना है। "
                 f"अभी प्राइस {p_int} डॉलर है। "
                 f"एंट्री {int(trade['entry'])} डॉलर पर, स्टॉप लॉस {int(trade['sl'])} डॉलर, "
                 f"और पहला टारगेट {int(trade['tp1'])} डॉलर का है। "
-                f"सिर्फ़ 500 रुपये के फिक्स रिस्क के साथ ही ट्रेड करें।"
+                f"सिर्फ़ 500 रुपये के फिक्स रिस्क के साथ ट्रेड करें।"
             )
         else:
             trend_word = "नीचे यानी डाउन" if analysis["trend_1h"] == "DOWN" else "ऊपर यानी अप"
             script = (
-                f"नमस्कार ट्रेडर्स! बिटकॉइन अभी {p_int} डॉलर के पास चल रहा है। "
+                f"नमस्ते ट्रेडर्स! बिटकॉइन अभी {p_int} डॉलर के पास चल रहा है। "
                 f"1 घंटे का ट्रेंड {trend_word} है, और 15 मिनट का आर एस आई {int(round(analysis['rsi_15m']))} है। "
                 f"अभी कोई पक्का सेटअप नहीं बना है, इसलिए फैसला है वेट। "
                 f"अभी न खरीदें, न बेचें, सही मौके का इंतज़ार करें।"
             )
 
-        # 1. हिंदी AI वॉइस जेनरेट करें
-        has_audio = False
-        try:
-            asyncio.run(_make_hindi_voice(script, voice_mp3))
-            has_audio = os.path.exists(voice_mp3) and os.path.getsize(voice_mp3) > 1000
-        except Exception as ve:
-            print("Voice TTS Error:", ve)
+        has_audio = generate_female_hindi_voice(script, voice_mp3)
 
-        # 2. एक-एक करके कैंडल्स एनिमेट करें (18 से 45 कैंडल्स तक स्मूद ग्रोथ)
-        steps = list(range(18, len(full_df) + 1, 2))
+        # 1. कैंडल एनीमेशन (18 से 45 कैंडल्स तक स्मूद ग्रोथ)
+        steps = list(range(18, len(full_df) + 1, 3))
         if steps[-1] != len(full_df):
             steps.append(len(full_df))
 
-        frames = []
-        for idx, count in enumerate(steps):
-            sub_df = full_df.iloc[:count]
-            is_last = (idx == len(steps) - 1)
-            if is_last and trade:
-                hlines = [trade["entry"], trade["sl"], trade["tp1"], trade["tp2"]]
-                colors = ["#38BDF8", "#F87171", "#4ADE80", "#00E676"]
-            else:
-                hlines = [float(sub_df["close"].iloc[-1])]
-                colors = ["#38BDF8"]
+        mouth_cycle = [0, 1, 2, 1, 2, 0, 1, 2]
+        frame_idx = 0
+        last_chart_im = None
 
-            render_chart(
-                sub_df, f"BTCUSD 15M (IST)  •  ${float(sub_df['close'].iloc[-1]):,.1f}",
-                tmp_png, hlines=hlines, colors=colors, figsize=(7.2, 5.4), dpi=100
-            )
-            frame_arr = build_reel_frame(
-                tmp_png, action, curr_price, analysis, trade=trade,
-                step_pct=(idx + 1) / len(steps)
-            )
-            frames.append(frame_arr)
-
-        # वीडियो राइटर (3 FPS: ~5 सेकंड एनीमेशन + 12 सेकंड आखिरी फ्रेम ताकि पूरी आवाज़ कवर हो)
         with imageio.get_writer(
-            raw_mp4, fps=3, codec="libx264",
+            raw_mp4, fps=4, codec="libx264",
             ffmpeg_params=["-pix_fmt", "yuv420p"]
         ) as writer:
-            for fr_arr in frames:
-                writer.append_data(fr_arr)
-            for _ in range(36):  # आखिरी क्लियर चार्ट को 12 सेकंड तक रोकें
-                writer.append_data(frames[-1])
+            for idx, count in enumerate(steps):
+                sub_df = full_df.iloc[:count]
+                is_last = (idx == len(steps) - 1)
+                if is_last and trade:
+                    hlines = [trade["entry"], trade["sl"], trade["tp1"], trade["tp2"]]
+                    colors = ["#38BDF8", "#F87171", "#4ADE80", "#00E676"]
+                else:
+                    hlines = [float(sub_df["close"].iloc[-1])]
+                    colors = ["#38BDF8"]
 
-        # 3. वीडियो और हिंदी आवाज़ को जोड़ें (आवाज़ खत्म होते ही वीडियो बंद)
+                render_chart(
+                    sub_df, f"BTCUSD 15M (IST)  •  ${float(sub_df['close'].iloc[-1]):,.1f}",
+                    tmp_png, hlines=hlines, colors=colors, figsize=(7.0, 5.0), dpi=100
+                )
+                c_im = Image.open(tmp_png).convert("RGB")
+                c_im.thumbnail((680, 505), Image.Resampling.LANCZOS)
+                last_chart_im = c_im
+
+                for _ in range(2):
+                    fr_arr = build_reel_frame(
+                        c_im, action, curr_price, analysis, trade=trade,
+                        step_pct=(idx + 1) / len(steps),
+                        mouth_state=mouth_cycle[frame_idx % len(mouth_cycle)],
+                        blink=(frame_idx % 16 == 0)
+                    )
+                    writer.append_data(fr_arr)
+                    frame_idx += 1
+
+            # 2. आखिरी क्लियर चार्ट पर 20 सेकंड तक 2D गर्ल बोलती रहेगी (आवाज़ खत्म होते ही वीडियो कटेगा)
+            for _ in range(80):
+                fr_arr = build_reel_frame(
+                    last_chart_im, action, curr_price, analysis, trade=trade,
+                    step_pct=1.0,
+                    mouth_state=mouth_cycle[frame_idx % len(mouth_cycle)],
+                    blink=(frame_idx % 16 == 0)
+                )
+                writer.append_data(fr_arr)
+                frame_idx += 1
+
+        # 3. imageio_ffmpeg के पक्के ffmpeg से वीडियो + हिंदी आवाज़ को जोड़ें
         if has_audio:
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
             cmd = [
-                "ffmpeg", "-y",
+                ffmpeg_exe, "-y",
                 "-i", raw_mp4,
                 "-i", voice_mp3,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "128k",
                 "-shortest",
                 "-movflags", "+faststart",
                 out_mp4
             ]
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if res.returncode != 0 or not os.path.exists(out_mp4):
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res.returncode == 0 and os.path.exists(out_mp4):
+                print("Audio + Video merged successfully!")
+            else:
+                print("FFmpeg merge error:", res.stderr[-300:])
                 os.replace(raw_mp4, out_mp4)
         else:
             os.replace(raw_mp4, out_mp4)
@@ -679,7 +790,6 @@ def create_animated_reel_with_voice(df_15m: pd.DataFrame, curr_price: float, ana
 
 
 def send_manual_status(data: dict, curr_price: float, fr: float, analysis: dict, reason: str):
-    """मैन्युअल Run workflow दबाने पर फोटो + 9:16 बोलती हुई हिंदी रील वीडियो।"""
     opt_note = get_atm_options_note(curr_price)
     ema_pos = "1H 20-EMA के ऊपर (UP)" if analysis["trend_1h"] == "UP" else "1H 20-EMA के नीचे (DOWN)"
     now_ist = datetime.datetime.now(IST).strftime("%d-%b %I:%M %p IST")
@@ -710,7 +820,7 @@ def send_manual_status(data: dict, curr_price: float, fr: float, analysis: dict,
     vid_file = create_animated_reel_with_voice(data["15m"], curr_price, analysis, trade=None)
     send_tg_video(
         vid_file,
-        "🎬 **Instagram Reels वीडियो (हिंदी वॉइस के साथ)**\n⏳ फैसला: **WAIT (अभी इंतज़ार करें)**",
+        "🎬 **2D एनीमे गर्ल + हिंदी आवाज़ (Instagram Reels Ready)**\n⏳ फैसला: **WAIT (अभी इंतज़ार करें)**",
         reply_to=msg_id
     )
 
@@ -809,7 +919,7 @@ def main():
         save_state(st)
         return
 
-    # --- पक्का BUY या SELL सिग्नल (फोटो + बोलती हुई 9:16 Reels वीडियो दोनों) ---
+    # --- पक्का BUY या SELL सिग्नल (फोटो + बोलती हुई 2D एनीमे गर्ल Reel वीडियो) ---
     opt_note = get_atm_options_note(trade["entry"])
     mode_tag = "📝 [PAPER]" if PAPER_MODE else "🚨 [LIVE]"
     ema_pos = "1H 20-EMA के ऊपर" if analysis["trend_1h"] == "UP" else "1H 20-EMA के नीचे"
@@ -848,13 +958,13 @@ def main():
     vid_file = create_animated_reel_with_voice(data["15m"], trade["entry"], analysis, trade=trade)
     send_tg_video(
         vid_file,
-        f"🎬 **Instagram Reels वीडियो (हिंदी वॉइस के साथ)**\n{action_header}",
+        f"🎬 **2D एनीमे गर्ल + हिंदी आवाज़ (Instagram Reels Ready)**\n{action_header}",
         reply_to=msg_id
     )
 
     st.update({"state": "ACTIVE_TRADE", "trade": trade, "signal_msg_id": msg_id})
     save_state(st)
-    print("Signal photo + Reels Hindi voice video sent!")
+    print("Signal photo + 2D Anime Girl Hindi voice Reel sent!")
 
 
 if __name__ == "__main__":
