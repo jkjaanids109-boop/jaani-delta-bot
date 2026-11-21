@@ -1,6 +1,8 @@
 import os
 import json
 import time
+import asyncio
+import subprocess
 import datetime
 import requests
 import pytz
@@ -9,8 +11,9 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import mplfinance as mpf
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont
 import imageio.v2 as imageio
+import edge_tts
 
 # ==============================================================================
 # 1. कॉन्फ़िगरेशन (GitHub Secrets से सीधे नाम मैच किए गए हैं)
@@ -67,7 +70,7 @@ def save_state(st: dict):
 
 
 # ==============================================================================
-# 3. टेलीग्राम अलर्ट (Text + Photo + 2D Video)
+# 3. टेलीग्राम अलर्ट (Text + Photo + 9:16 Reels Video with Voice)
 # ==============================================================================
 def send_tg_message(text: str, reply_to: int = None):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -116,13 +119,15 @@ def send_tg_video(video_path: str, caption: str, reply_to: int = None):
         "chat_id": TELEGRAM_CHAT_ID,
         "caption": caption[:1020],
         "parse_mode": "Markdown",
+        "width": 720,
+        "height": 1280,
         "supports_streaming": "true"
     }
     if reply_to:
         data["reply_to_message_id"] = reply_to
     try:
         with open(video_path, "rb") as f:
-            r = requests.post(url, data=data, files={"video": f}, timeout=45).json()
+            r = requests.post(url, data=data, files={"video": f}, timeout=60).json()
         if not r.get("ok"):
             print("TG Video Response:", r)
         if os.path.exists(video_path):
@@ -157,7 +162,6 @@ def fetch_candles(resolution: str, count: int = 300) -> pd.DataFrame:
             df = df.dropna(subset=["time", "open", "high", "low", "close"])
             df = df.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
 
-            # चल रही अधूरी (Unclosed) कैंडल हटाना
             if len(df) > 0 and (df.iloc[-1]["time"] + sec) > int(time.time()):
                 df = df.iloc[:-1].reset_index(drop=True)
 
@@ -440,23 +444,26 @@ def get_atm_options_note(spot_price: float) -> str:
 
 
 # ==============================================================================
-# 6. ग्रीन/रेड चार्ट (IST टाइम) + 2D एनालिसिस वीडियो (MP4)
+# 6. ग्रीन/रेड चार्ट (IST) + 9:16 एनिमेटेड Instagram Reel वीडियो (हिंदी AI वॉइस सहित)
 # ==============================================================================
 def get_chart_style():
     mc = mpf.make_marketcolors(
-        up="#089981", down="#F23645",
+        up="#00E676", down="#FF1744",
         edge="inherit", wick="inherit", volume="in"
     )
     return mpf.make_mpf_style(
         base_mpf_style="nightclouds",
         marketcolors=mc,
+        facecolor="#0F172A",
+        figcolor="#0F172A",
+        gridcolor="#1E293B",
         gridstyle=":",
         y_on_right=True
     )
 
 
-def render_chart(df: pd.DataFrame, title: str, filename: str, hlines=None, colors=None, add_ema20=False) -> str:
-    plot_df = df.tail(55).copy()
+def render_chart(df: pd.DataFrame, title: str, filename: str, hlines=None, colors=None, figsize=(10, 5.6), dpi=115) -> str:
+    plot_df = df.copy()
     plot_df["datetime"] = plot_df["datetime"].dt.tz_convert(IST).dt.tz_localize(None)
     plot_df = plot_df.set_index("datetime")
 
@@ -465,79 +472,214 @@ def render_chart(df: pd.DataFrame, title: str, filename: str, hlines=None, color
         volume=True,
         style=get_chart_style(),
         title=title,
-        figsize=(10, 5.6),
-        savefig=dict(fname=filename, dpi=115, bbox_inches="tight")
+        figsize=figsize,
+        savefig=dict(fname=filename, dpi=dpi, bbox_inches="tight", facecolor="#0F172A")
     )
     if hlines:
-        kwargs["hlines"] = dict(hlines=hlines, colors=colors, linestyle="--", linewidths=1.4)
-    if add_ema20:
-        ema_full = df["close"].ewm(span=EMA_1H_PERIOD, adjust=False).mean().tail(55)
-        ema_full.index = plot_df.index
-        kwargs["addplot"] = mpf.make_addplot(ema_full, color="#FFD600", width=1.4)
+        kwargs["hlines"] = dict(hlines=hlines, colors=colors, linestyle="--", linewidths=1.5)
 
     mpf.plot(plot_df, **kwargs)
     return filename
 
 
-def create_2d_video(data: dict, curr_price: float, analysis: dict, verdict_en: str, trade=None, out_mp4="btc_2d_video.mp4") -> str:
-    """1D -> 4H -> 1H (20-EMA) -> 15M चारों टाइमफ्रेम का 8-सेकंड 2D MP4 वीडियो।"""
-    frames_files = []
+def load_font(size: int, bold: bool = True):
+    paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            return ImageFont.truetype(p, size)
+    return ImageFont.load_default()
+
+
+def build_reel_frame(chart_img_path: str, action: str, curr_price: float, analysis: dict, trade=None, step_pct: float = 1.0) -> np.ndarray:
+    """720x1280 (9:16 Instagram Reels) का प्रोफेशनल डार्क ट्रेडिंग कार्ड।"""
+    W, H = 720, 1280
+    canvas = Image.new("RGB", (W, H), (11, 17, 32))
+    draw = ImageDraw.Draw(canvas)
+
+    f_title = load_font(40, True)
+    f_badge = load_font(46, True)
+    f_med = load_font(30, True)
+    f_small = load_font(24, False)
+
+    # रंग और बैज सेटअप
+    if action == "BUY":
+        badge_bg, badge_txt = (0, 180, 95), "SIGNAL: BUY NOW"
+    elif action == "SELL":
+        badge_bg, badge_txt = (225, 35, 65), "SIGNAL: SELL NOW"
+    else:
+        badge_bg, badge_txt = (230, 145, 10), "DECISION: WAIT"
+
+    # टॉप हेडर
+    draw.rectangle([(0, 0), (W, 130)], fill=(18, 28, 50))
+    draw.text((40, 26), "BTCUSD LIVE ANALYSIS", font=f_title, fill=(255, 255, 255))
+    now_str = datetime.datetime.now(IST).strftime("%d %b | %I:%M %p IST")
+    draw.text((40, 82), f"Delta Exchange India  •  {now_str}", font=f_small, fill=(148, 163, 184))
+
+    # बड़ा BUY / SELL / WAIT बैज
+    draw.rounded_rectangle([(40, 155), (W - 40, 245)], radius=20, fill=badge_bg)
+    bbox = draw.textbbox((0, 0), badge_txt, font=f_badge)
+    tw = bbox[2] - bbox[0]
+    draw.text(((W - tw) // 2, 172), badge_txt, font=f_badge, fill=(255, 255, 255))
+
+    # बीच में एनिमेटेड 15M चार्ट
+    chart_im = Image.open(chart_img_path).convert("RGB")
+    chart_im.thumbnail((W - 40, 540), Image.Resampling.LANCZOS)
+    cx = (W - chart_im.width) // 2
+    cy = 275 + (540 - chart_im.height) // 2
+    canvas.paste(chart_im, (cx, cy))
+
+    # प्रोग्रेस बार (एनीमेशन का फील देने के लिए)
+    bar_w = int((W - 80) * min(1.0, max(0.05, step_pct)))
+    draw.rounded_rectangle([(40, 835), (W - 40, 847)], radius=6, fill=(30, 41, 59))
+    draw.rounded_rectangle([(40, 835), (40 + bar_w, 847)], radius=6, fill=badge_bg)
+
+    # नीचे का इन्फो कार्ड
+    draw.rounded_rectangle([(40, 875), (W - 40, 1185)], radius=22, fill=(18, 28, 50), outline=(51, 65, 85), width=2)
+
+    if trade:
+        lines = [
+            (f"ENTRY :  ${trade['entry']:,.1f}", (56, 189, 248)),
+            (f"STOP LOSS :  ${trade['sl']:,.1f}", (248, 113, 113)),
+            (f"TARGET 1 :  ${trade['tp1']:,.1f}", (74, 222, 128)),
+            (f"TARGET 2 :  ${trade['tp2']:,.1f}", (0, 230, 118)),
+            (f"RISK: Rs.500  |  LOTS: {trade['lots']}  |  R:R 1:{trade['net_rr']}", (250, 204, 21)),
+        ]
+    else:
+        lines = [
+            (f"LIVE PRICE :  ${curr_price:,.1f}", (56, 189, 248)),
+            (f"TREND :  1D {analysis['trend_1d']}  |  4H {analysis['trend_4h']}  |  1H {analysis['trend_1h']}", (248, 250, 252)),
+            (f"15M RSI :  {analysis['rsi_15m']}   |   VOL :  {analysis['vol_ratio']}x", (250, 204, 21)),
+            (f"WEEKLY VWAP :  ${analysis['vwap']:,.1f}", (251, 146, 60)),
+            ("NO TRADE ZONE — WAITING FOR SETUP", (148, 163, 184)),
+        ]
+
+    y_pos = 905
+    for txt, col in lines:
+        draw.text((70, y_pos), txt, font=f_med if y_pos < 1100 else f_small, fill=col)
+        y_pos += 54
+
+    # फ़ुटर ब्रांडिंग
+    footer = "JAANI 24x7 AUTO TRADING BOT"
+    fb = draw.textbbox((0, 0), footer, font=f_small)
+    draw.text(((W - (fb[2] - fb[0])) // 2, 1215), footer, font=f_small, fill=(100, 116, 139))
+
+    return np.array(canvas)
+
+
+async def _make_hindi_voice(script: str, out_mp3: str):
+    comm = edge_tts.Communicate(script, voice="hi-IN-MadhurNeural", rate="+6%")
+    await comm.save(out_mp3)
+
+
+def create_animated_reel_with_voice(df_15m: pd.DataFrame, curr_price: float, analysis: dict, trade=None, out_mp4="btc_reel.mp4") -> str:
+    """9:16 एनिमेटेड कैंडल वीडियो + असली हिंदी AI वॉइसओवर (Instagram Reels Ready)।"""
+    raw_mp4 = "raw_anim.mp4"
+    voice_mp3 = "voice_hi.mp3"
+    tmp_png = "anim_step.png"
+
     try:
-        frames_files.append(render_chart(
-            data["1d"], f"1/4 | BTCUSD 1D (IST) | Trend: {analysis['trend_1d']} | {verdict_en}", "f1_1d.png",
-            hlines=[curr_price], colors=["#2962FF"]
-        ))
-        frames_files.append(render_chart(
-            data["4h"], f"2/4 | BTCUSD 4H (IST) | Trend: {analysis['trend_4h']} | {verdict_en}", "f2_4h.png",
-            hlines=[curr_price], colors=["#2962FF"]
-        ))
-        frames_files.append(render_chart(
-            data["1h"], f"3/4 | BTCUSD 1H + 20EMA (IST) | Trend: {analysis['trend_1h']} | {verdict_en}", "f3_1h.png",
-            hlines=[curr_price], colors=["#2962FF"], add_ema20=True
-        ))
+        action = trade["side"] if trade else "WAIT"
+        full_df = df_15m.tail(45).reset_index(drop=True)
 
+        # हिंदी वॉइसओवर स्क्रिप्ट
+        p_int = int(round(curr_price))
         if trade:
-            hlines = [trade["entry"], trade["sl"], trade["tp1"], trade["tp2"]]
-            colors = ["#2962FF", "#F23645", "#089981", "#00E676"]
-            title_15m = f"4/4 | BTCUSD 15M (IST) | {verdict_en} ({trade['pattern']})"
+            side_word = "खरीदने यानी बाय" if trade["side"] == "BUY" else "बेचने यानी सेल"
+            script = (
+                f"नमस्कार ट्रेडर्स! बिटकॉइन में पक्का {side_word} का सिग्नल बना है। "
+                f"अभी प्राइस {p_int} डॉलर है। "
+                f"एंट्री {int(trade['entry'])} डॉलर पर, स्टॉप लॉस {int(trade['sl'])} डॉलर, "
+                f"और पहला टारगेट {int(trade['tp1'])} डॉलर का है। "
+                f"सिर्फ़ 500 रुपये के फिक्स रिस्क के साथ ही ट्रेड करें।"
+            )
         else:
-            hlines = [curr_price]
-            colors = ["#2962FF"]
-            if abs(analysis["vwap"] - curr_price) / curr_price <= 0.05:
-                hlines.append(analysis["vwap"])
-                colors.append("#FF9800")
-            title_15m = f"4/4 | BTCUSD 15M (IST) | {verdict_en} | RSI: {analysis['rsi_15m']}"
+            trend_word = "नीचे यानी डाउन" if analysis["trend_1h"] == "DOWN" else "ऊपर यानी अप"
+            script = (
+                f"नमस्कार ट्रेडर्स! बिटकॉइन अभी {p_int} डॉलर के पास चल रहा है। "
+                f"1 घंटे का ट्रेंड {trend_word} है, और 15 मिनट का आर एस आई {int(round(analysis['rsi_15m']))} है। "
+                f"अभी कोई पक्का सेटअप नहीं बना है, इसलिए फैसला है वेट। "
+                f"अभी न खरीदें, न बेचें, सही मौके का इंतज़ार करें।"
+            )
 
-        frames_files.append(render_chart(
-            data["15m"], title_15m, "f4_15m.png", hlines=hlines, colors=colors
-        ))
+        # 1. हिंदी AI वॉइस जेनरेट करें
+        has_audio = False
+        try:
+            asyncio.run(_make_hindi_voice(script, voice_mp3))
+            has_audio = os.path.exists(voice_mp3) and os.path.getsize(voice_mp3) > 1000
+        except Exception as ve:
+            print("Voice TTS Error:", ve)
 
-        # 1024x576 (16:9) फ़िक्स साइज़ में 2 सेकंड प्रति चार्ट = 8 सेकंड वीडियो
+        # 2. एक-एक करके कैंडल्स एनिमेट करें (18 से 45 कैंडल्स तक स्मूद ग्रोथ)
+        steps = list(range(18, len(full_df) + 1, 2))
+        if steps[-1] != len(full_df):
+            steps.append(len(full_df))
+
+        frames = []
+        for idx, count in enumerate(steps):
+            sub_df = full_df.iloc[:count]
+            is_last = (idx == len(steps) - 1)
+            if is_last and trade:
+                hlines = [trade["entry"], trade["sl"], trade["tp1"], trade["tp2"]]
+                colors = ["#38BDF8", "#F87171", "#4ADE80", "#00E676"]
+            else:
+                hlines = [float(sub_df["close"].iloc[-1])]
+                colors = ["#38BDF8"]
+
+            render_chart(
+                sub_df, f"BTCUSD 15M (IST)  •  ${float(sub_df['close'].iloc[-1]):,.1f}",
+                tmp_png, hlines=hlines, colors=colors, figsize=(7.2, 5.4), dpi=100
+            )
+            frame_arr = build_reel_frame(
+                tmp_png, action, curr_price, analysis, trade=trade,
+                step_pct=(idx + 1) / len(steps)
+            )
+            frames.append(frame_arr)
+
+        # वीडियो राइटर (3 FPS: ~5 सेकंड एनीमेशन + 12 सेकंड आखिरी फ्रेम ताकि पूरी आवाज़ कवर हो)
         with imageio.get_writer(
-            out_mp4, fps=2, codec="libx264",
-            ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+            raw_mp4, fps=3, codec="libx264",
+            ffmpeg_params=["-pix_fmt", "yuv420p"]
         ) as writer:
-            for fp in frames_files:
-                img = Image.open(fp).convert("RGB")
-                img = ImageOps.pad(img, (1024, 576), color=(19, 23, 34))
-                arr = np.array(img)
-                for _ in range(4):  # 4 frames @ 2fps = 2 seconds per chart
-                    writer.append_data(arr)
+            for fr_arr in frames:
+                writer.append_data(fr_arr)
+            for _ in range(36):  # आखिरी क्लियर चार्ट को 12 सेकंड तक रोकें
+                writer.append_data(frames[-1])
 
-        for fp in frames_files:
-            if os.path.exists(fp):
-                os.remove(fp)
+        # 3. वीडियो और हिंदी आवाज़ को जोड़ें (आवाज़ खत्म होते ही वीडियो बंद)
+        if has_audio:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", raw_mp4,
+                "-i", voice_mp3,
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "128k",
+                "-shortest",
+                "-movflags", "+faststart",
+                out_mp4
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res.returncode != 0 or not os.path.exists(out_mp4):
+                os.replace(raw_mp4, out_mp4)
+        else:
+            os.replace(raw_mp4, out_mp4)
+
+        for f_clean in [raw_mp4, voice_mp3, tmp_png]:
+            if os.path.exists(f_clean):
+                os.remove(f_clean)
         return out_mp4
     except Exception as e:
-        print("Video Error:", e)
-        for fp in frames_files:
-            if os.path.exists(fp):
-                os.remove(fp)
+        print("Reel Video Error:", e)
+        for f_clean in [raw_mp4, voice_mp3, tmp_png]:
+            if os.path.exists(f_clean):
+                os.remove(f_clean)
         return ""
 
 
 def send_manual_status(data: dict, curr_price: float, fr: float, analysis: dict, reason: str):
-    """मैन्युअल Run workflow दबाने पर फोटो + 2D वीडियो + साफ़ WAIT फैसला।"""
+    """मैन्युअल Run workflow दबाने पर फोटो + 9:16 बोलती हुई हिंदी रील वीडियो।"""
     opt_note = get_atm_options_note(curr_price)
     ema_pos = "1H 20-EMA के ऊपर (UP)" if analysis["trend_1h"] == "UP" else "1H 20-EMA के नीचे (DOWN)"
     now_ist = datetime.datetime.now(IST).strftime("%d-%b %I:%M %p IST")
@@ -554,21 +696,21 @@ def send_manual_status(data: dict, curr_price: float, fr: float, analysis: dict,
     )
 
     hlines = [curr_price]
-    colors = ["#2962FF"]
+    colors = ["#38BDF8"]
     if abs(analysis["vwap"] - curr_price) / curr_price <= 0.05:
         hlines.append(analysis["vwap"])
         colors.append("#FF9800")
 
     photo_file = render_chart(
-        data["15m"], f"BTCUSD 15M (IST) | WAIT | Price: ${curr_price:,.1f} | RSI: {analysis['rsi_15m']}",
+        data["15m"].tail(55), f"BTCUSD 15M (IST) | WAIT | Price: ${curr_price:,.1f} | RSI: {analysis['rsi_15m']}",
         "status_chart.png", hlines=hlines, colors=colors
     )
     msg_id = send_tg_photo(photo_file, caption)
 
-    vid_file = create_2d_video(data, curr_price, analysis, "WAIT (NO TRADE)", trade=None)
+    vid_file = create_animated_reel_with_voice(data["15m"], curr_price, analysis, trade=None)
     send_tg_video(
         vid_file,
-        "🎬 **2D मल्टी-टाइमफ्रेम वीडियो (1D → 4H → 1H → 15M)**\n⏳ फैसला: **WAIT (अभी इंतज़ार करें)**",
+        "🎬 **Instagram Reels वीडियो (हिंदी वॉइस के साथ)**\n⏳ फैसला: **WAIT (अभी इंतज़ार करें)**",
         reply_to=msg_id
     )
 
@@ -667,7 +809,7 @@ def main():
         save_state(st)
         return
 
-    # --- पक्का BUY या SELL सिग्नल (फोटो + 2D वीडियो दोनों) ---
+    # --- पक्का BUY या SELL सिग्नल (फोटो + बोलती हुई 9:16 Reels वीडियो दोनों) ---
     opt_note = get_atm_options_note(trade["entry"])
     mode_tag = "📝 [PAPER]" if PAPER_MODE else "🚨 [LIVE]"
     ema_pos = "1H 20-EMA के ऊपर" if analysis["trend_1h"] == "UP" else "1H 20-EMA के नीचे"
@@ -692,27 +834,27 @@ def main():
     )
 
     hlines = [trade["entry"], trade["sl"], trade["tp1"], trade["tp2"]]
-    colors = ["#2962FF", "#F23645", "#089981", "#00E676"]
+    colors = ["#38BDF8", "#F87171", "#4ADE80", "#00E676"]
     if abs(analysis["vwap"] - trade["entry"]) / trade["entry"] <= 0.03:
         hlines.append(analysis["vwap"])
         colors.append("#FF9800")
 
     photo_file = render_chart(
-        data["15m"], f"BTCUSD 15M (IST) | {trade['side']} ({trade['pattern']})",
+        data["15m"].tail(55), f"BTCUSD 15M (IST) | {trade['side']} ({trade['pattern']})",
         "signal_chart.png", hlines=hlines, colors=colors
     )
     msg_id = send_tg_photo(photo_file, caption)
 
-    vid_file = create_2d_video(data, trade["entry"], analysis, f"{trade['side']} SIGNAL", trade=trade)
+    vid_file = create_animated_reel_with_voice(data["15m"], trade["entry"], analysis, trade=trade)
     send_tg_video(
         vid_file,
-        f"🎬 **2D मल्टी-टाइमफ्रेम वीडियो (1D → 4H → 1H → 15M)**\n{action_header}",
+        f"🎬 **Instagram Reels वीडियो (हिंदी वॉइस के साथ)**\n{action_header}",
         reply_to=msg_id
     )
 
     st.update({"state": "ACTIVE_TRADE", "trade": trade, "signal_msg_id": msg_id})
     save_state(st)
-    print("Signal photo + 2D video sent and state saved!")
+    print("Signal photo + Reels Hindi voice video sent!")
 
 
 if __name__ == "__main__":
