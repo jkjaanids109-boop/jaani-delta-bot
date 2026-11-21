@@ -11,30 +11,29 @@ matplotlib.use("Agg")
 import mplfinance as mpf
 
 # ==============================================================================
-# 1. कॉन्फ़िगरेशन (Token/Chat ID सीधे GitHub Secrets से आएँगे)
+# 1. कॉन्फ़िगरेशन (GitHub Secrets से सीधे नाम मैच किए गए हैं)
 # ==============================================================================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 REST_BASE_URL = "https://api.india.delta.exchange"
 SYMBOL = "BTCUSD"
 
-PAPER_MODE = True                 # पहले 7-10 दिन True रखें
-RISK_PER_TRADE_INR = 1000.0       # प्रति ट्रेड फिक्स्ड रिस्क (₹ में)
-USD_TO_INR = 85.0
-LOT_SIZE_BTC = 0.001
-ROUND_TRIP_FEE_PCT = 0.00118      # 0.05% x 2 Taker + 18% GST
+PAPER_MODE = True                 # शुरुआती 7-10 दिन टेस्टिंग के लिए True
+RISK_PER_TRADE_INR = 500.0        # प्रति ट्रेड फिक्स्ड रिस्क (₹500)
+USD_TO_INR = 85.0                 # Delta India फिक्स्ड कन्वर्ज़न
+LOT_SIZE_BTC = 0.001              # 1 Lot = 0.001 BTC
+ROUND_TRIP_FEE_PCT = 0.00118      # 0.05% x 2 Taker + 18% GST = 0.118%
 
 RSI_PERIOD = 14
 EMA_1H_PERIOD = 20
 ATR_PERIOD = 14
-VOLUME_MULTIPLIER = 1.35
-PINBAR_WICK_RATIO = 2.5
-MIN_SL_PCT = 0.0035
-MIN_NET_RR = 1.5
+VOLUME_MULTIPLIER = 1.35          # 20-SMA से कम से कम 1.35x वॉल्यूम
+PINBAR_WICK_RATIO = 2.5           # Wick कम से कम Body से 2.5 गुना
+MIN_SL_PCT = 0.0035               # न्यूनतम 0.35% SL
+MIN_NET_RR = 1.5                  # फ़ीस+GST के बाद न्यूनतम 1:1.5 R:R
 
-COOLDOWN_NORMAL_MIN = 90
-COOLDOWN_DOUBLE_SL_MIN = 180
+COOLDOWN_MINUTES = 0              # Cooldown बंद (24/7 बिना ब्रेक सिग्नल)
 STATE_FILE = "bot_state.json"
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -42,22 +41,19 @@ RES_SECONDS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 
 
 # ==============================================================================
-# 2. स्टेट मेमोरी (bot_state.json — ताकि GitHub पर पुराना ट्रेड याद रहे)
+# 2. स्टेट मेमोरी (bot_state.json)
 # ==============================================================================
 def load_state() -> dict:
     default = {
         "state": "SCANNING",
         "trade": None,
         "signal_msg_id": None,
-        "cooldown_until": 0,
-        "consecutive_sls": 0,
         "last_candle_ts": 0
     }
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                default.update(data)
+                default.update(json.load(f))
         except Exception:
             pass
     return default
@@ -72,10 +68,10 @@ def save_state(st: dict):
 # 3. टेलीग्राम अलर्ट
 # ==============================================================================
 def send_tg_message(text: str, reply_to: int = None):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[TG LOG]", text)
         return None
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
     if reply_to:
         payload["reply_to_message_id"] = reply_to
@@ -88,10 +84,10 @@ def send_tg_message(text: str, reply_to: int = None):
 
 
 def send_tg_photo(photo_path: str, caption: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[TG PHOTO]", caption)
         return None
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
     try:
         with open(photo_path, "rb") as f:
             r = requests.post(
@@ -132,7 +128,7 @@ def fetch_candles(resolution: str, count: int = 300) -> pd.DataFrame:
             df = df.dropna(subset=["time", "open", "high", "low", "close"])
             df = df.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
 
-            # अधूरी (Unclosed) कैंडल हटाना
+            # चल रही अधूरी (Unclosed) कैंडल हटाना
             if len(df) > 0 and (df.iloc[-1]["time"] + sec) > int(time.time()):
                 df = df.iloc[:-1].reset_index(drop=True)
 
@@ -279,9 +275,11 @@ def analyze_market(data: dict) -> dict:
         "signal": "WAIT", "mode": None, "pattern": None, "price": price,
         "rsi_15m": round(rsi_15m, 2), "atr_15m": round(atr_15m, 2),
         "vol_ratio": round(vol_ratio, 2), "vwap": round(vwap, 2),
-        "htf_levels": htf_levels, "recent_swing_high": rec_h, "recent_swing_low": rec_l
+        "trend_1h": trend_1h, "htf_levels": htf_levels,
+        "recent_swing_high": rec_h, "recent_swing_low": rec_l
     }
 
+    # Sideways / Extreme Volatility फ़िल्टर
     if atr_sma > 0 and not (0.55 <= (atr_15m / atr_sma) <= 2.6):
         return res
 
@@ -332,24 +330,36 @@ def evaluate_trade(analysis: dict, df_15m, funding_rate: float) -> dict:
             obs_warn = f"ध्यान दें: ${lvl:,.0f} पर HTF सपोर्ट है"
 
     lots = max(1, int(((RISK_PER_TRADE_INR / USD_TO_INR) / (sl_dist + fee_usd)) / LOT_SIZE_BTC))
+
+    # Funding सेटलमेंट चेतावनी (5:30 AM, 1:30 PM, 9:30 PM IST के 15 मिनट भीतर)
+    now_ist = datetime.datetime.now(IST)
+    funding_warn = ""
+    for h in [5, 13, 21]:
+        f_time = now_ist.replace(hour=h, minute=30, second=0, microsecond=0)
+        if abs((now_ist - f_time).total_seconds()) <= 900:
+            funding_warn = "⚠️ Funding सेटलमेंट 15 मिनट के भीतर है!"
+
     return {
         "approved": True, "side": side, "mode": analysis["mode"], "pattern": analysis["pattern"],
         "entry": round(entry, 1), "sl": sl, "tp1": tp1, "tp2": tp2, "net_rr": net_rr,
         "lots": lots, "risk_inr": RISK_PER_TRADE_INR, "obstacle_warning": obs_warn,
-        "funding_rate_pct": round(funding_rate * 100, 4), "tp1_hit": False
+        "funding_rate_pct": round(funding_rate * 100, 4), "funding_warn": funding_warn,
+        "tp1_hit": False
     }
 
 
 def get_atm_options_note(spot_price: float) -> str:
+    """ATM Call (CE) और Put (PE) दोनों का पूरा डेटा + 2:30 PM IST के बाद ऑटो रोलओवर।"""
     try:
         res = requests.get(
             f"{REST_BASE_URL}/v2/tickers",
             params={"contract_types": "call_options,put_options", "underlying_asset_symbols": "BTC"},
             timeout=10
         ).json().get("result", [])
+
         now_ist = datetime.datetime.now(IST)
         today_str = now_ist.strftime("%d%m%y")
-        skip_today = now_ist.hour >= 15
+        skip_today = (now_ist.hour > 14) or (now_ist.hour == 14 and now_ist.minute >= 30)
 
         expiries = {}
         for item in res:
@@ -362,21 +372,44 @@ def get_atm_options_note(spot_price: float) -> str:
                 continue
 
         if not expiries:
-            return "ऑप्शन डेटा उपलब्ध नहीं।"
+            return "📊 **BTC ATM Options:** डेटा अभी उपलब्ध नहीं।"
+
         nearest_exp = min(expiries.keys())
         items = expiries[nearest_exp]
         atm = min(set(x[1] for x in items), key=lambda s: abs(s - spot_price))
         ce = next((x[2] for x in items if x[0] == "C" and x[1] == atm), None)
         pe = next((x[2] for x in items if x[0] == "P" and x[1] == atm), None)
 
-        def fmt(o):
+        def parse_opt(o):
             if not o:
-                return "N/A"
-            return f"Mark ${float(o.get('mark_price') or 0):.1f} | OI {float(o.get('oi') or 0):,.0f} | Vol {float(o.get('volume') or 0):,.0f}"
+                return "N/A", 0.0, 0.0
+            mp = float(o.get("mark_price") or 0)
+            oi = float(o.get("oi") or 0)
+            vol = float(o.get("volume") or 0)
+            greeks = o.get("greeks") or {}
+            delta = float(greeks.get("delta") or 0)
+            theta = float(greeks.get("theta") or 0)
+            txt = f"प्रीमियम `${mp:.1f}` | Vol `{vol:,.0f}` | OI `{oi:,.0f}` | Δ `{delta:.2f}` | Θ `{theta:.1f}`"
+            return txt, oi, vol
 
-        return f"📊 **ATM Options ({int(atm)} | Exp: {nearest_exp.strftime('%d-%b')})**\n• CE: {fmt(ce)}\n• PE: {fmt(pe)}"
+        ce_txt, ce_oi, ce_vol = parse_opt(ce)
+        pe_txt, pe_oi, pe_vol = parse_opt(pe)
+
+        if (ce_vol + ce_oi) > (pe_vol + pe_oi) * 1.1:
+            bias = "Call में ज़्यादा एक्टिविटी → मोमेंटम **Bullish**"
+        elif (pe_vol + pe_oi) > (ce_vol + ce_oi) * 1.1:
+            bias = "Put में ज़्यादा एक्टिविटी → मोमेंटम **Bearish**"
+        else:
+            bias = "Call और Put लगभग बराबर → **Neutral / संतुलित**"
+
+        return (
+            f"📊 **BTC ATM Options (Strike: {int(atm)} | Exp: {nearest_exp.strftime('%d-%b')})**\n"
+            f"• **CALL (CE):** {ce_txt}\n"
+            f"• **PUT (PE):** {pe_txt}\n"
+            f"• **Option संकेत:** {bias}"
+        )
     except Exception:
-        return "ऑप्शन डेटा उपलब्ध नहीं।"
+        return "📊 **BTC ATM Options:** डेटा अभी उपलब्ध नहीं।"
 
 
 def create_15m_chart(df_15m, trade: dict, vwap_val: float, filename="signal_chart.png") -> str:
@@ -398,7 +431,7 @@ def create_15m_chart(df_15m, trade: dict, vwap_val: float, filename="signal_char
 
 
 # ==============================================================================
-# 6. मुख्य One-Shot रनर (GitHub Actions के लिए)
+# 6. मुख्य 24/7 One-Shot रनर (Cooldown = 0)
 # ==============================================================================
 def main():
     st = load_state()
@@ -413,54 +446,50 @@ def main():
         t = st["trade"]
         side = t["side"]
 
-        # TP1 -> Breakeven शिफ़्ट
+        # TP1 -> SL को Entry (Breakeven) पर शिफ़्ट करें
         if not t.get("tp1_hit") and ((side == "BUY" and curr_price >= t["tp1"]) or (side == "SELL" and curr_price <= t["tp1"])):
             t["tp1_hit"] = True
             t["sl"] = t["entry"]
-            send_tg_message(f"🎯 **TP1 हिट (${t['tp1']:,.1f})!** SL को Entry (${t['entry']:,.1f} - Breakeven) पर शिफ़्ट कर दिया है।", reply_to=st["signal_msg_id"])
+            send_tg_message(
+                f"🎯 **TP1 हिट (${t['tp1']:,.1f})!**\nSL को ऑटोमैटिक Entry (${t['entry']:,.1f} - Breakeven) पर शिफ़्ट कर दिया गया है। अब TP2 ट्रैक हो रहा है।",
+                reply_to=st["signal_msg_id"]
+            )
             save_state(st)
             return
 
-        # TP2 -> ट्रेड सफल + Cooldown
+        # TP2 -> ट्रेड सफल और तुरंत नए सेटअप के लिए तैयार (Cooldown = 0)
         if (side == "BUY" and curr_price >= t["tp2"]) or (side == "SELL" and curr_price <= t["tp2"]):
-            send_tg_message(f"🏆 **TP2 हिट (${t['tp2']:,.1f}) — ट्रेड सफल!** {COOLDOWN_NORMAL_MIN} मिनट Cooldown शुरू।", reply_to=st["signal_msg_id"])
-            st.update({"state": "COOLDOWN", "trade": None, "signal_msg_id": None, "cooldown_until": time.time() + COOLDOWN_NORMAL_MIN * 60, "consecutive_sls": 0})
+            send_tg_message(
+                f"🏆 **TP2 हिट (${t['tp2']:,.1f}) — ट्रेड सफल!**\nबॉट तुरंत अगले नए सेटअप की तलाश में लग गया है।",
+                reply_to=st["signal_msg_id"]
+            )
+            st.update({"state": "SCANNING", "trade": None, "signal_msg_id": None})
             save_state(st)
             return
 
-        # SL -> ट्रेड बंद + Cooldown
+        # SL -> ट्रेड बंद और तुरंत नए सेटअप के लिए तैयार (Cooldown = 0)
         if (side == "BUY" and curr_price <= t["sl"]) or (side == "SELL" and curr_price >= t["sl"]):
             if t.get("tp1_hit"):
-                cd_min, st["consecutive_sls"] = COOLDOWN_NORMAL_MIN, 0
-                msg = f"🛡️ **Breakeven SL हिट (${t['sl']:,.1f})** (TP1 बुक हो चुका था)। {cd_min} मिनट Cooldown शुरू।"
+                msg = f"🛡️ **Breakeven SL हिट (${t['sl']:,.1f})** (TP1 पहले ही बुक हो चुका था)।\nबॉट तुरंत अगले नए सेटअप के लिए तैयार है।"
             else:
-                st["consecutive_sls"] += 1
-                cd_min = COOLDOWN_DOUBLE_SL_MIN if st["consecutive_sls"] >= 2 else COOLDOWN_NORMAL_MIN
-                msg = f"🛑 **Stop Loss हिट (${t['sl']:,.1f})।** {cd_min} मिनट Cooldown शुरू।"
+                msg = f"🛑 **Stop Loss हिट (${t['sl']:,.1f})।**\nबॉट तुरंत अगले नए सेटअप के लिए तैयार है।"
             send_tg_message(msg, reply_to=st["signal_msg_id"])
-            st.update({"state": "COOLDOWN", "trade": None, "signal_msg_id": None, "cooldown_until": time.time() + cd_min * 60})
+            st.update({"state": "SCANNING", "trade": None, "signal_msg_id": None})
             save_state(st)
             return
 
-        # लाइव अपडेट (Reply में)
+        # ट्रेड चालू रहने पर हर ~5 मिनट में लाइव Reply अपडेट
         df_15m = fetch_candles("15m", 60)
         rsi_txt = f"{float(wilders_rsi(df_15m['close'], RSI_PERIOD).iloc[-1]):.1f}" if not df_15m.empty else "N/A"
         diff = (ltp - t["entry"]) if side == "BUY" else (t["entry"] - ltp)
         emoji = "🟢" if diff >= 0 else "🔴"
         send_tg_message(
-            f"{emoji} **लाइव अपडेट ({side})**\n• LTP: `${ltp:,.1f}` ({diff:+.1f} USD)\n• 15M RSI: `{rsi_txt}` | SL: `${t['sl']:,.1f}`",
+            f"{emoji} **लाइव अपडेट ({side})**\n• LTP: `${ltp:,.1f}` ({diff:+.1f} USD)\n• 15M RSI: `{rsi_txt}` | वर्तमान SL: `${t['sl']:,.1f}`",
             reply_to=st["signal_msg_id"]
         )
         return
 
-    # --- अवस्था 2: यदि COOLDOWN चल रहा है ---
-    if st["state"] == "COOLDOWN":
-        if time.time() < st["cooldown_until"]:
-            print("In Cooldown. Skipping scan.")
-            return
-        st["state"] = "SCANNING"
-
-    # --- अवस्था 3: नया 15M मार्केट स्कैन ---
+    # --- अवस्था 2: नया 15M मार्केट स्कैन (कोई स्पैम नहीं) ---
     data = {
         "1d": fetch_candles("1d", 500),
         "4h": fetch_candles("4h", 350),
@@ -474,14 +503,13 @@ def main():
     latest_ts = int(data["15m"]["time"].iloc[-1])
     if latest_ts <= st["last_candle_ts"]:
         print("Same candle already scanned.")
-        save_state(st)
         return
 
     st["last_candle_ts"] = latest_ts
     analysis = analyze_market(data)
 
     if analysis["signal"] == "WAIT":
-        print("No setup found.")
+        print("No setup found. Staying quiet.")
         save_state(st)
         return
 
@@ -494,19 +522,23 @@ def main():
     opt_note = get_atm_options_note(trade["entry"])
     chart_file = create_15m_chart(data["15m"], trade, analysis["vwap"])
     mode_tag = "📝 [PAPER]" if PAPER_MODE else "🚨 [LIVE]"
+    ema_pos = "1H 20-EMA के ऊपर" if analysis["trend_1h"] == "UP" else "1H 20-EMA के नीचे"
+
     warn_text = f"\n⚠️ {trade['obstacle_warning']}" if trade["obstacle_warning"] else ""
+    if trade["funding_warn"]:
+        warn_text += f"\n{trade['funding_warn']}"
 
     caption = (
         f"{mode_tag} **पक्का {trade['side']} सिग्नल — BTCUSD**\n"
-        f"• मोड: {trade['mode']}\n"
-        f"• पैटर्न: {trade['pattern']} (Vol: {analysis['vol_ratio']}x | RSI: {analysis['rsi_15m']})\n\n"
+        f"• **सेटअप:** {trade['mode']} | {trade['pattern']}\n"
+        f"• **पुष्टि:** वॉल्यूम `{analysis['vol_ratio']}x` | 15M RSI `{analysis['rsi_15m']}` | {ema_pos}\n\n"
         f"🎯 **Entry:** `${trade['entry']:,.1f}`\n"
         f"🛑 **Stop Loss:** `${trade['sl']:,.1f}`\n"
-        f"✅ **Target 1:** `${trade['tp1']:,.1f}`\n"
+        f"✅ **Target 1:** `${trade['tp1']:,.1f}` *(TP1 पर SL ऑटो Entry पर शिफ़्ट)*\n"
         f"🏆 **Target 2:** `${trade['tp2']:,.1f}`\n\n"
         f"⚖️ **Net R:R (फ़ीस+GST बाद):** `1:{trade['net_rr']}`\n"
-        f"📦 **सुझावित Lot Size:** `{trade['lots']} Lots` (रिस्क: ₹{int(trade['risk_inr'])})\n"
-        f"📌 Weekly VWAP: `${analysis['vwap']:,.1f}` | Funding: `{trade['funding_rate_pct']}%`"
+        f"📦 **सुझावित Lot Size:** `{trade['lots']} Lots` *(रिस्क: ₹{int(trade['risk_inr'])})*\n"
+        f"📌 **Weekly VWAP:** `${analysis['vwap']:,.1f}` | **Funding:** `{trade['funding_rate_pct']}%`"
         f"{warn_text}\n\n{opt_note}"
     )
 
