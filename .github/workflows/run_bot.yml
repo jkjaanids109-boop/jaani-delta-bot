@@ -2,11 +2,11 @@ name: Jaani 24x7 Trading Bot
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # GitHub Actions का न्यूनतम समय 5 मिनट है
-  workflow_dispatch:         # हाथ से 'Run workflow' दबाकर टेस्ट करने के लिए
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 permissions:
-  contents: write            # bot_state.json सेव करने के लिए ज़रूरी
+  contents: write
 
 jobs:
   run-bot:
@@ -25,9 +25,9 @@ jobs:
 
       - name: Run BTC Trading Bot
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python btc_bot.py
+        run: python bot.py
 
       - name: Save Bot Memory
         run: |
