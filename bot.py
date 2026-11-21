@@ -9,6 +9,8 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import mplfinance as mpf
+from PIL import Image, ImageOps
+import imageio.v2 as imageio
 
 # ==============================================================================
 # 1. कॉन्फ़िगरेशन (GitHub Secrets से सीधे नाम मैच किए गए हैं)
@@ -65,7 +67,7 @@ def save_state(st: dict):
 
 
 # ==============================================================================
-# 3. टेलीग्राम अलर्ट
+# 3. टेलीग्राम अलर्ट (Text + Photo + 2D Video)
 # ==============================================================================
 def send_tg_message(text: str, reply_to: int = None):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -103,6 +105,31 @@ def send_tg_photo(photo_path: str, caption: str):
         return r.get("result", {}).get("message_id")
     except Exception as e:
         print("TG Photo Error:", e)
+        return None
+
+
+def send_tg_video(video_path: str, caption: str, reply_to: int = None):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not video_path or not os.path.exists(video_path):
+        return None
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVideo"
+    data = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "caption": caption[:1020],
+        "parse_mode": "Markdown",
+        "supports_streaming": "true"
+    }
+    if reply_to:
+        data["reply_to_message_id"] = reply_to
+    try:
+        with open(video_path, "rb") as f:
+            r = requests.post(url, data=data, files={"video": f}, timeout=45).json()
+        if not r.get("ok"):
+            print("TG Video Response:", r)
+        if os.path.exists(video_path):
+            os.remove(video_path)
+        return r.get("result", {}).get("message_id")
+    except Exception as e:
+        print("TG Video Error:", e)
         return None
 
 
@@ -277,11 +304,11 @@ def analyze_market(data: dict) -> dict:
         "signal": "WAIT", "mode": None, "pattern": None, "price": price,
         "rsi_15m": round(rsi_15m, 2), "atr_15m": round(atr_15m, 2),
         "vol_ratio": round(vol_ratio, 2), "vwap": round(vwap, 2),
-        "trend_1h": trend_1h, "htf_levels": htf_levels,
+        "trend_1d": trend_1d, "trend_4h": trend_4h, "trend_1h": trend_1h,
+        "htf_levels": htf_levels,
         "recent_swing_high": rec_h, "recent_swing_low": rec_l
     }
 
-    # Sideways / Extreme Volatility फ़िल्टर
     if atr_sma > 0 and not (0.55 <= (atr_15m / atr_sma) <= 2.6):
         return res
 
@@ -333,7 +360,6 @@ def evaluate_trade(analysis: dict, df_15m, funding_rate: float) -> dict:
 
     lots = max(1, int(((RISK_PER_TRADE_INR / USD_TO_INR) / (sl_dist + fee_usd)) / LOT_SIZE_BTC))
 
-    # Funding सेटलमेंट चेतावनी (5:30 AM, 1:30 PM, 9:30 PM IST के 15 मिनट भीतर)
     now_ist = datetime.datetime.now(IST)
     funding_warn = ""
     for h in [5, 13, 21]:
@@ -351,7 +377,6 @@ def evaluate_trade(analysis: dict, df_15m, funding_rate: float) -> dict:
 
 
 def get_atm_options_note(spot_price: float) -> str:
-    """ATM Call (CE) और Put (PE) दोनों का पूरा डेटा + 2:30 PM IST के बाद ऑटो रोलओवर।"""
     try:
         res = requests.get(
             f"{REST_BASE_URL}/v2/tickers",
@@ -414,65 +439,142 @@ def get_atm_options_note(spot_price: float) -> str:
         return "📊 **BTC ATM Options:** डेटा अभी उपलब्ध नहीं।"
 
 
-def create_status_chart(df_15m, curr_price: float, rsi_val: float, vwap_val: float, filename="status_chart.png") -> str:
-    """मैन्युअल अपडेट के लिए 15M लाइव चार्ट इमेज।"""
-    plot_df = df_15m.tail(60).copy().set_index("datetime")
-    hlines = [curr_price]
-    colors = ["#2962FF"]
-    if abs(vwap_val - curr_price) / curr_price <= 0.05:
-        hlines.append(vwap_val)
-        colors.append("#FF9800")
-
-    style = mpf.make_mpf_style(base_mpf_style="nightclouds", gridstyle=":", y_on_right=True)
-    mpf.plot(
-        plot_df, type="candle", volume=True, style=style,
-        title=f"BTCUSD 15M Live | Price: ${curr_price:,.1f} | RSI: {rsi_val}",
-        hlines=dict(hlines=hlines, colors=colors, linestyle="--", linewidths=1.3),
-        savefig=dict(fname=filename, dpi=130, bbox_inches="tight")
+# ==============================================================================
+# 6. ग्रीन/रेड चार्ट (IST टाइम) + 2D एनालिसिस वीडियो (MP4)
+# ==============================================================================
+def get_chart_style():
+    mc = mpf.make_marketcolors(
+        up="#089981", down="#F23645",
+        edge="inherit", wick="inherit", volume="in"
     )
+    return mpf.make_mpf_style(
+        base_mpf_style="nightclouds",
+        marketcolors=mc,
+        gridstyle=":",
+        y_on_right=True
+    )
+
+
+def render_chart(df: pd.DataFrame, title: str, filename: str, hlines=None, colors=None, add_ema20=False) -> str:
+    plot_df = df.tail(55).copy()
+    plot_df["datetime"] = plot_df["datetime"].dt.tz_convert(IST).dt.tz_localize(None)
+    plot_df = plot_df.set_index("datetime")
+
+    kwargs = dict(
+        type="candle",
+        volume=True,
+        style=get_chart_style(),
+        title=title,
+        figsize=(10, 5.6),
+        savefig=dict(fname=filename, dpi=115, bbox_inches="tight")
+    )
+    if hlines:
+        kwargs["hlines"] = dict(hlines=hlines, colors=colors, linestyle="--", linewidths=1.4)
+    if add_ema20:
+        ema_full = df["close"].ewm(span=EMA_1H_PERIOD, adjust=False).mean().tail(55)
+        ema_full.index = plot_df.index
+        kwargs["addplot"] = mpf.make_addplot(ema_full, color="#FFD600", width=1.4)
+
+    mpf.plot(plot_df, **kwargs)
     return filename
 
 
-def create_15m_chart(df_15m, trade: dict, vwap_val: float, filename="signal_chart.png") -> str:
-    """पक्का BUY/SELL सिग्नल आने पर Entry/SL/TP लाइनों के साथ 15M चार्ट।"""
-    plot_df = df_15m.tail(60).copy().set_index("datetime")
-    hlines = [trade["entry"], trade["sl"], trade["tp1"], trade["tp2"]]
-    colors = ["#2962FF", "#F23645", "#089981", "#00E676"]
-    if abs(vwap_val - trade["entry"]) / trade["entry"] <= 0.03:
-        hlines.append(vwap_val)
-        colors.append("#FF9800")
+def create_2d_video(data: dict, curr_price: float, analysis: dict, verdict_en: str, trade=None, out_mp4="btc_2d_video.mp4") -> str:
+    """1D -> 4H -> 1H (20-EMA) -> 15M चारों टाइमफ्रेम का 8-सेकंड 2D MP4 वीडियो।"""
+    frames_files = []
+    try:
+        frames_files.append(render_chart(
+            data["1d"], f"1/4 | BTCUSD 1D (IST) | Trend: {analysis['trend_1d']} | {verdict_en}", "f1_1d.png",
+            hlines=[curr_price], colors=["#2962FF"]
+        ))
+        frames_files.append(render_chart(
+            data["4h"], f"2/4 | BTCUSD 4H (IST) | Trend: {analysis['trend_4h']} | {verdict_en}", "f2_4h.png",
+            hlines=[curr_price], colors=["#2962FF"]
+        ))
+        frames_files.append(render_chart(
+            data["1h"], f"3/4 | BTCUSD 1H + 20EMA (IST) | Trend: {analysis['trend_1h']} | {verdict_en}", "f3_1h.png",
+            hlines=[curr_price], colors=["#2962FF"], add_ema20=True
+        ))
 
-    style = mpf.make_mpf_style(base_mpf_style="nightclouds", gridstyle=":", y_on_right=True)
-    mpf.plot(
-        plot_df, type="candle", volume=True, style=style,
-        title=f"BTCUSD 15M | {trade['side']} ({trade['pattern']})",
-        hlines=dict(hlines=hlines, colors=colors, linestyle="--", linewidths=1.3),
-        savefig=dict(fname=filename, dpi=130, bbox_inches="tight")
-    )
-    return filename
+        if trade:
+            hlines = [trade["entry"], trade["sl"], trade["tp1"], trade["tp2"]]
+            colors = ["#2962FF", "#F23645", "#089981", "#00E676"]
+            title_15m = f"4/4 | BTCUSD 15M (IST) | {verdict_en} ({trade['pattern']})"
+        else:
+            hlines = [curr_price]
+            colors = ["#2962FF"]
+            if abs(analysis["vwap"] - curr_price) / curr_price <= 0.05:
+                hlines.append(analysis["vwap"])
+                colors.append("#FF9800")
+            title_15m = f"4/4 | BTCUSD 15M (IST) | {verdict_en} | RSI: {analysis['rsi_15m']}"
+
+        frames_files.append(render_chart(
+            data["15m"], title_15m, "f4_15m.png", hlines=hlines, colors=colors
+        ))
+
+        # 1024x576 (16:9) फ़िक्स साइज़ में 2 सेकंड प्रति चार्ट = 8 सेकंड वीडियो
+        with imageio.get_writer(
+            out_mp4, fps=2, codec="libx264",
+            ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+        ) as writer:
+            for fp in frames_files:
+                img = Image.open(fp).convert("RGB")
+                img = ImageOps.pad(img, (1024, 576), color=(19, 23, 34))
+                arr = np.array(img)
+                for _ in range(4):  # 4 frames @ 2fps = 2 seconds per chart
+                    writer.append_data(arr)
+
+        for fp in frames_files:
+            if os.path.exists(fp):
+                os.remove(fp)
+        return out_mp4
+    except Exception as e:
+        print("Video Error:", e)
+        for fp in frames_files:
+            if os.path.exists(fp):
+                os.remove(fp)
+        return ""
 
 
-def send_manual_status(df_15m, curr_price: float, fr: float, analysis: dict, reason: str):
-    """मैन्युअल Run workflow दबाने पर 15M चार्ट फोटो + लाइव अपडेट।"""
+def send_manual_status(data: dict, curr_price: float, fr: float, analysis: dict, reason: str):
+    """मैन्युअल Run workflow दबाने पर फोटो + 2D वीडियो + साफ़ WAIT फैसला।"""
     opt_note = get_atm_options_note(curr_price)
     ema_pos = "1H 20-EMA के ऊपर (UP)" if analysis["trend_1h"] == "UP" else "1H 20-EMA के नीचे (DOWN)"
     now_ist = datetime.datetime.now(IST).strftime("%d-%b %I:%M %p IST")
-    msg = (
-        f"✅ **बॉट लाइव और कनेक्टेड है — BTCUSD**\n"
+
+    caption = (
+        f"⏳ **फैसला: WAIT (अभी इंतज़ार करें — न खरीदें, न बेचें)**\n"
         f"🕒 समय: `{now_ist}`\n"
         f"💰 **लाइव प्राइस:** `${curr_price:,.1f}`\n"
-        f"📈 **ट्रेंड (1H):** {ema_pos}\n"
+        f"📈 **ट्रेंड:** 1D `{analysis['trend_1d']}` | 4H `{analysis['trend_4h']}` | {ema_pos}\n"
         f"📊 **15M RSI:** `{analysis['rsi_15m']}` | **वॉल्यूम:** `{analysis['vol_ratio']}x`\n"
         f"📌 **Weekly VWAP:** `${analysis['vwap']:,.1f}` | **Funding:** `{round(fr, 4)}%`\n"
-        f"🔍 **स्टेटस:** {reason}\n\n"
+        f"🔍 **कारण:** {reason}\n\n"
         f"{opt_note}"
     )
-    chart_file = create_status_chart(df_15m, curr_price, analysis["rsi_15m"], analysis["vwap"])
-    send_tg_photo(chart_file, msg)
+
+    hlines = [curr_price]
+    colors = ["#2962FF"]
+    if abs(analysis["vwap"] - curr_price) / curr_price <= 0.05:
+        hlines.append(analysis["vwap"])
+        colors.append("#FF9800")
+
+    photo_file = render_chart(
+        data["15m"], f"BTCUSD 15M (IST) | WAIT | Price: ${curr_price:,.1f} | RSI: {analysis['rsi_15m']}",
+        "status_chart.png", hlines=hlines, colors=colors
+    )
+    msg_id = send_tg_photo(photo_file, caption)
+
+    vid_file = create_2d_video(data, curr_price, analysis, "WAIT (NO TRADE)", trade=None)
+    send_tg_video(
+        vid_file,
+        "🎬 **2D मल्टी-टाइमफ्रेम वीडियो (1D → 4H → 1H → 15M)**\n⏳ फैसला: **WAIT (अभी इंतज़ार करें)**",
+        reply_to=msg_id
+    )
 
 
 # ==============================================================================
-# 6. मुख्य 24/7 One-Shot रनर (Cooldown = 0)
+# 7. मुख्य 24/7 One-Shot रनर (Cooldown = 0)
 # ==============================================================================
 def main():
     is_manual = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch"
@@ -487,8 +589,8 @@ def main():
     if st["state"] == "ACTIVE_TRADE" and st["trade"]:
         t = st["trade"]
         side = t["side"]
+        side_hi = "BUY (खरीदा हुआ)" if side == "BUY" else "SELL (बेचा हुआ)"
 
-        # TP1 -> SL को Entry (Breakeven) पर शिफ़्ट करें
         if not t.get("tp1_hit") and ((side == "BUY" and curr_price >= t["tp1"]) or (side == "SELL" and curr_price <= t["tp1"])):
             t["tp1_hit"] = True
             t["sl"] = t["entry"]
@@ -499,7 +601,6 @@ def main():
             save_state(st)
             return
 
-        # TP2 -> ट्रेड सफल और तुरंत नए सेटअप के लिए तैयार (Cooldown = 0)
         if (side == "BUY" and curr_price >= t["tp2"]) or (side == "SELL" and curr_price <= t["tp2"]):
             send_tg_message(
                 f"🏆 **TP2 हिट (${t['tp2']:,.1f}) — ट्रेड सफल!**\nबॉट तुरंत अगले नए सेटअप की तलाश में लग गया है।",
@@ -509,7 +610,6 @@ def main():
             save_state(st)
             return
 
-        # SL -> ट्रेड बंद और तुरंत नए सेटअप के लिए तैयार (Cooldown = 0)
         if (side == "BUY" and curr_price <= t["sl"]) or (side == "SELL" and curr_price >= t["sl"]):
             if t.get("tp1_hit"):
                 msg = f"🛡️ **Breakeven SL हिट (${t['sl']:,.1f})** (TP1 पहले ही बुक हो चुका था)।\nबॉट तुरंत अगले नए सेटअप के लिए तैयार है।"
@@ -520,18 +620,17 @@ def main():
             save_state(st)
             return
 
-        # ट्रेड चालू रहने पर हर ~5 मिनट में लाइव Reply अपडेट
         df_15m = fetch_candles("15m", 60)
         rsi_txt = f"{float(wilders_rsi(df_15m['close'], RSI_PERIOD).iloc[-1]):.1f}" if not df_15m.empty else "N/A"
         diff = (ltp - t["entry"]) if side == "BUY" else (t["entry"] - ltp)
         emoji = "🟢" if diff >= 0 else "🔴"
         send_tg_message(
-            f"{emoji} **लाइव अपडेट ({side})**\n• LTP: `${ltp:,.1f}` ({diff:+.1f} USD)\n• 15M RSI: `{rsi_txt}` | वर्तमान SL: `${t['sl']:,.1f}`",
+            f"{emoji} **लाइव ट्रेड अपडेट — {side_hi}**\n• LTP: `${ltp:,.1f}` ({diff:+.1f} USD)\n• 15M RSI: `{rsi_txt}` | वर्तमान SL: `${t['sl']:,.1f}`",
             reply_to=st["signal_msg_id"]
         )
         return
 
-    # --- अवस्था 2: नया 15M मार्केट स्कैन (ऑटो रन पर कोई स्पैम नहीं) ---
+    # --- अवस्था 2: नया 15M मार्केट स्कैन ---
     data = {
         "1d": fetch_candles("1d", 500),
         "4h": fetch_candles("4h", 350),
@@ -546,7 +645,7 @@ def main():
     if latest_ts <= st["last_candle_ts"]:
         if is_manual:
             analysis = analyze_market(data)
-            send_manual_status(data["15m"], curr_price, fr, analysis, "अभी कोई पक्का सेटअप नहीं बना है (24/7 स्कैनिंग चालू है)।")
+            send_manual_status(data, curr_price, fr, analysis, "अभी कोई पक्का सेटअप नहीं बना है (24/7 स्कैनिंग चालू है)।")
         print("Same candle already scanned.")
         return
 
@@ -555,7 +654,7 @@ def main():
 
     if analysis["signal"] == "WAIT":
         if is_manual:
-            send_manual_status(data["15m"], curr_price, fr, analysis, "अभी कोई पक्का सेटअप नहीं बना है (24/7 स्कैनिंग चालू है)।")
+            send_manual_status(data, curr_price, fr, analysis, "अभी कोई पक्का सेटअप नहीं बना है (24/7 स्कैनिंग चालू है)।")
         print("No setup found. Staying quiet.")
         save_state(st)
         return
@@ -563,22 +662,23 @@ def main():
     trade = evaluate_trade(analysis, data["15m"], fr)
     if not trade["approved"]:
         if is_manual:
-            send_manual_status(data["15m"], curr_price, fr, analysis, "सेटअप बना था, लेकिन Risk/Reward या HTF रेज़िस्टेंस फ़िल्टर ने रोक दिया।")
+            send_manual_status(data, curr_price, fr, analysis, "सेटअप बना था, लेकिन Risk/Reward या HTF सपोर्ट/रेज़िस्टेंस फ़िल्टर ने रोक दिया।")
         print("Trade rejected by Risk/Obstacle filter.")
         save_state(st)
         return
 
+    # --- पक्का BUY या SELL सिग्नल (फोटो + 2D वीडियो दोनों) ---
     opt_note = get_atm_options_note(trade["entry"])
-    chart_file = create_15m_chart(data["15m"], trade, analysis["vwap"])
     mode_tag = "📝 [PAPER]" if PAPER_MODE else "🚨 [LIVE]"
     ema_pos = "1H 20-EMA के ऊपर" if analysis["trend_1h"] == "UP" else "1H 20-EMA के नीचे"
+    action_header = "🟢 **फैसला: BUY (खरीदें) — BTCUSD**" if trade["side"] == "BUY" else "🔴 **फैसला: SELL (बेचें) — BTCUSD**"
 
     warn_text = f"\n⚠️ {trade['obstacle_warning']}" if trade["obstacle_warning"] else ""
     if trade["funding_warn"]:
         warn_text += f"\n{trade['funding_warn']}"
 
     caption = (
-        f"{mode_tag} **पक्का {trade['side']} सिग्नल — BTCUSD**\n"
+        f"{mode_tag} {action_header}\n"
         f"• **सेटअप:** {trade['mode']} | {trade['pattern']}\n"
         f"• **पुष्टि:** वॉल्यूम `{analysis['vol_ratio']}x` | 15M RSI `{analysis['rsi_15m']}` | {ema_pos}\n\n"
         f"🎯 **Entry:** `${trade['entry']:,.1f}`\n"
@@ -591,10 +691,28 @@ def main():
         f"{warn_text}\n\n{opt_note}"
     )
 
-    msg_id = send_tg_photo(chart_file, caption)
+    hlines = [trade["entry"], trade["sl"], trade["tp1"], trade["tp2"]]
+    colors = ["#2962FF", "#F23645", "#089981", "#00E676"]
+    if abs(analysis["vwap"] - trade["entry"]) / trade["entry"] <= 0.03:
+        hlines.append(analysis["vwap"])
+        colors.append("#FF9800")
+
+    photo_file = render_chart(
+        data["15m"], f"BTCUSD 15M (IST) | {trade['side']} ({trade['pattern']})",
+        "signal_chart.png", hlines=hlines, colors=colors
+    )
+    msg_id = send_tg_photo(photo_file, caption)
+
+    vid_file = create_2d_video(data, trade["entry"], analysis, f"{trade['side']} SIGNAL", trade=trade)
+    send_tg_video(
+        vid_file,
+        f"🎬 **2D मल्टी-टाइमफ्रेम वीडियो (1D → 4H → 1H → 15M)**\n{action_header}",
+        reply_to=msg_id
+    )
+
     st.update({"state": "ACTIVE_TRADE", "trade": trade, "signal_msg_id": msg_id})
     save_state(st)
-    print("Signal sent and state saved!")
+    print("Signal photo + 2D video sent and state saved!")
 
 
 if __name__ == "__main__":
