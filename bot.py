@@ -18,7 +18,7 @@ import edge_tts
 from gtts import gTTS
 
 # ==============================================================================
-# 1. कॉन्फ़िगरेशन
+# 1. कॉन्फ़िगरेशन (100% 15-मिनट सटीक ट्रेडिंग इंजन)
 # ==============================================================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -34,18 +34,19 @@ LOT_SIZE_BTC = 0.001              # 1 Lot = 0.001 BTC
 ROUND_TRIP_FEE_PCT = 0.00118      # 0.05% x 2 Taker + 18% GST = 0.118%
 
 RSI_PERIOD = 14
-EMA_1H_PERIOD = 20
+EMA_FAST_15M = 20                 # 15M मुख्य ट्रेंड EMA
+EMA_SLOW_15M = 50                 # 15M सपोर्टिंग ट्रेंड EMA
 ATR_PERIOD = 14
-VOLUME_MULTIPLIER = 1.35          # 20-SMA से कम से कम 1.35x वॉल्यूम
-PINBAR_WICK_RATIO = 2.5           # Wick कम से कम Body से 2.5 गुना
-MIN_SL_PCT = 0.0035               # न्यूनतम 0.35% SL
+VOLUME_MULTIPLIER = 1.10          # 15M 20-SMA से कम से कम 1.10x वॉल्यूम
+PINBAR_WICK_RATIO = 1.8           # Wick कम से कम Body से 1.8 गुना
+MIN_SL_PCT = 0.0030               # न्यूनतम 0.30% SL
 MIN_NET_RR = 1.5                  # फ़ीस+GST के बाद न्यूनतम 1:1.5 R:R
 
 COOLDOWN_MINUTES = 0              # Cooldown बंद (24/7 बिना ब्रेक सिग्नल)
 STATE_FILE = "bot_state.json"
 
 IST = pytz.timezone("Asia/Kolkata")
-RES_SECONDS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
+RES_SECONDS = {"15m": 900}
 
 
 # ==============================================================================
@@ -142,9 +143,9 @@ def send_tg_video(video_path: str, caption: str, reply_to: int = None):
 
 
 # ==============================================================================
-# 4. Delta India डेटा इंजन
+# 4. Delta India 15M डेटा इंजन
 # ==============================================================================
-def fetch_candles(resolution: str, count: int = 300) -> pd.DataFrame:
+def fetch_candles(resolution: str = "15m", count: int = 750) -> pd.DataFrame:
     sec = RES_SECONDS[resolution]
     now = int(time.time())
     start = now - (count + 10) * sec
@@ -165,12 +166,13 @@ def fetch_candles(resolution: str, count: int = 300) -> pd.DataFrame:
             df = df.dropna(subset=["time", "open", "high", "low", "close"])
             df = df.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
 
+            # चल रही अधूरी (Unclosed) कैंडल हटाना ताकि फ़ेक सिग्नल न आए
             if len(df) > 0 and (df.iloc[-1]["time"] + sec) > int(time.time()):
                 df = df.iloc[:-1].reset_index(drop=True)
 
             df = df[(df["close"] > 0) & (df["high"] >= df["low"])]
             df["datetime"] = pd.to_datetime(df["time"], unit="s", utc=True)
-            if len(df) >= 50:
+            if len(df) >= 60:
                 return df.tail(count).reset_index(drop=True)
         except Exception as e:
             print(f"Fetch error ({resolution}):", e)
@@ -191,7 +193,7 @@ def get_live_ticker():
 
 
 # ==============================================================================
-# 5. प्राइस एक्शन, इंडिकेटर्स और गेटकीपर
+# 5. सटीक 15M प्राइस एक्शन, EMA और गेटकीपर
 # ==============================================================================
 def wilders_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -234,119 +236,134 @@ def find_swings(df: pd.DataFrame, n: int = 3):
     return highs, lows
 
 
-def get_trend(df: pd.DataFrame) -> str:
-    highs, lows = find_swings(df.tail(120).reset_index(drop=True), n=3)
-    if len(highs) < 2 or len(lows) < 2:
-        return "RANGE"
-    if highs[-1][1] > highs[-2][1] and lows[-1][1] > lows[-2][1]:
-        return "UP"
-    if highs[-1][1] < highs[-2][1] and lows[-1][1] < lows[-2][1]:
-        return "DOWN"
-    return "RANGE"
-
-
-def check_15m_patterns(df_15m: pd.DataFrame, key_levels: list, atr_val: float):
+def check_15m_patterns(df_15m: pd.DataFrame, swing_levels: list, atr_val: float, ema20: float, trend_15m: str):
     c, p = df_15m.iloc[-1], df_15m.iloc[-2]
     c_range = c["high"] - c["low"]
     body = abs(c["close"] - c["open"])
     upper_wick = c["high"] - max(c["open"], c["close"])
     lower_wick = min(c["open"], c["close"]) - c["low"]
 
-    if c_range < 0.5 * atr_val or c_range == 0:
+    if c_range < 0.35 * atr_val or c_range == 0:
         return None, None
 
     close_pos = (c["close"] - c["low"]) / c_range
     eff_body = max(body, 0.05 * c_range)
+    tol = 0.12 * atr_val
 
-    for lvl in key_levels:
-        if c["low"] < lvl and c["close"] > lvl and close_pos >= 0.55:
-            return "BUY", "Liquidity Sweep"
-        if c["high"] > lvl and c["close"] < lvl and close_pos <= 0.45:
-            return "SELL", "Liquidity Sweep"
+    # 1. Liquidity Sweep (15M Swing High/Low से रिवर्सल)
+    for lvl in swing_levels:
+        if c["low"] < lvl and c["close"] > lvl and close_pos >= 0.52:
+            return "BUY", "15M Liquidity Sweep"
+        if c["high"] > lvl and c["close"] < lvl and close_pos <= 0.48:
+            return "SELL", "15M Liquidity Sweep"
 
-    if lower_wick >= PINBAR_WICK_RATIO * eff_body and close_pos >= 0.65:
-        return "BUY", "Pin Bar (Hammer)"
-    if upper_wick >= PINBAR_WICK_RATIO * eff_body and close_pos <= 0.35:
-        return "SELL", "Pin Bar (Shooting Star)"
+    # 2. Pin Bar (Hammer / Shooting Star)
+    if lower_wick >= PINBAR_WICK_RATIO * eff_body and close_pos >= 0.60:
+        return "BUY", "15M Pin Bar (Hammer)"
+    if upper_wick >= PINBAR_WICK_RATIO * eff_body and close_pos <= 0.40:
+        return "SELL", "15M Pin Bar (Shooting Star)"
 
+    # 3. Engulfing (24/7 क्रिप्टो के लिए सटीक बॉडी एंगल्फ़िंग)
     p_bull, c_bull = p["close"] > p["open"], c["close"] > c["open"]
-    if (not p_bull) and c_bull and (c["close"] > p["open"]) and (c["open"] <= p["close"]):
-        return "BUY", "Bullish Engulfing"
-    if p_bull and (not c_bull) and (c["close"] < p["open"]) and (c["open"] >= p["close"]):
-        return "SELL", "Bearish Engulfing"
+    if (not p_bull) and c_bull and (c["close"] > p["open"]) and (c["open"] <= p["close"] + tol):
+        return "BUY", "15M Bullish Engulfing"
+    if p_bull and (not c_bull) and (c["close"] < p["open"]) and (c["open"] >= p["close"] - tol):
+        return "SELL", "15M Bearish Engulfing"
+
+    # 4. 15M EMA Pullback / Momentum Breakout (ट्रेंड की दिशा में मज़बूत कैंडल)
+    body_ratio = body / c_range
+    if body_ratio >= 0.55:
+        if trend_15m == "UP" and c_bull and c["close"] > ema20 and c["low"] <= ema20 + (0.6 * atr_val):
+            return "BUY", "15M EMA Pullback Momentum"
+        if trend_15m == "DOWN" and (not c_bull) and c["close"] < ema20 and c["high"] >= ema20 - (0.6 * atr_val):
+            return "SELL", "15M EMA Pullback Momentum"
 
     return None, None
 
 
-def analyze_market(data: dict) -> dict:
-    df_1d, df_4h, df_1h, df_15m = data["1d"], data["4h"], data["1h"], data["15m"]
-    df_15m = df_15m.copy()
-    df_15m["rsi"] = wilders_rsi(df_15m["close"], RSI_PERIOD)
-    df_15m["atr"] = calc_atr(df_15m, ATR_PERIOD)
-    df_15m["vol_sma"] = df_15m["volume"].shift(1).rolling(20).mean()
+def analyze_market_15m(df_15m: pd.DataFrame) -> dict:
+    df = df_15m.copy()
+    df["rsi"] = wilders_rsi(df["close"], RSI_PERIOD)
+    df["atr"] = calc_atr(df, ATR_PERIOD)
+    df["ema20"] = df["close"].ewm(span=EMA_FAST_15M, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=EMA_SLOW_15M, adjust=False).mean()
+    df["vol_sma"] = df["volume"].shift(1).rolling(20).mean()
 
-    ema_1h = df_1h["close"].ewm(span=EMA_1H_PERIOD, adjust=False).mean().iloc[-1]
-    price = float(df_15m["close"].iloc[-1])
-    rsi_15m = float(df_15m["rsi"].iloc[-1])
-    atr_15m = float(df_15m["atr"].iloc[-1])
-    atr_sma = float(df_15m["atr"].rolling(20).mean().iloc[-1])
-    vol_ratio = float(df_15m["volume"].iloc[-1]) / float(df_15m["vol_sma"].iloc[-1] or 1.0)
-    vwap = calc_weekly_vwap(df_15m)
+    price = float(df["close"].iloc[-1])
+    rsi_15m = float(df["rsi"].iloc[-1])
+    atr_15m = float(df["atr"].iloc[-1])
+    atr_sma = float(df["atr"].rolling(20).mean().iloc[-1])
+    ema20 = float(df["ema20"].iloc[-1])
+    ema50 = float(df["ema50"].iloc[-1])
+    vol_ratio = float(df["volume"].iloc[-1]) / float(df["vol_sma"].iloc[-1] or 1.0)
+    vwap = calc_weekly_vwap(df)
 
-    trend_1d, trend_4h = get_trend(df_1d), get_trend(df_4h)
-    trend_1h = "UP" if price > ema_1h else "DOWN"
-    pdh, pdl = float(df_1d["high"].iloc[-1]), float(df_1d["low"].iloc[-1])
+    # 15M मुख्य ट्रेंड (20-EMA और 50-EMA के आधार पर)
+    if price > ema20 and ema20 >= ema50:
+        trend_15m = "UP"
+        trend_label = "STRONG UP (20 & 50 EMA के ऊपर)"
+    elif price < ema20 and ema20 <= ema50:
+        trend_15m = "DOWN"
+        trend_label = "STRONG DOWN (20 & 50 EMA के नीचे)"
+    elif price > ema20:
+        trend_15m = "UP"
+        trend_label = "UP (15M 20-EMA के ऊपर)"
+    else:
+        trend_15m = "DOWN"
+        trend_label = "DOWN (15M 20-EMA के नीचे)"
 
-    sw_h_4h, sw_l_4h = find_swings(df_4h.tail(150).reset_index(drop=True), n=3)
-    demand_4h, supply_4h = [v for _, v in sw_l_4h[-4:]], [v for _, v in sw_h_4h[-4:]]
-
-    sw_h_15m, sw_l_15m = find_swings(df_15m.tail(60).reset_index(drop=True), n=3)
-    rec_h = sw_h_15m[-1][1] if sw_h_15m else float(df_15m["high"].tail(15).max())
-    rec_l = sw_l_15m[-1][1] if sw_l_15m else float(df_15m["low"].tail(15).min())
-
-    htf_levels = [pdh, pdl] + demand_4h + supply_4h
-    key_levels = htf_levels + [rec_h, rec_l]
+    sw_h, sw_l = find_swings(df.tail(96).reset_index(drop=True), n=3)
+    swing_highs = [v for _, v in sw_h[-4:]]
+    swing_lows = [v for _, v in sw_l[-4:]]
+    rec_h = swing_highs[-1] if swing_highs else float(df["high"].tail(15).max())
+    rec_l = swing_lows[-1] if swing_lows else float(df["low"].tail(15).min())
+    swing_levels = swing_highs + swing_lows
 
     res = {
         "signal": "WAIT", "mode": None, "pattern": None, "price": price,
         "rsi_15m": round(rsi_15m, 2), "atr_15m": round(atr_15m, 2),
+        "ema20": round(ema20, 1), "ema50": round(ema50, 1),
         "vol_ratio": round(vol_ratio, 2), "vwap": round(vwap, 2),
-        "trend_1d": trend_1d, "trend_4h": trend_4h, "trend_1h": trend_1h,
-        "htf_levels": htf_levels,
+        "trend_15m": trend_15m, "trend_label": trend_label,
+        "swing_levels": swing_levels,
         "recent_swing_high": rec_h, "recent_swing_low": rec_l
     }
 
-    if atr_sma > 0 and not (0.55 <= (atr_15m / atr_sma) <= 2.6):
+    # बहुत ज़्यादा डेड मार्केट फ़िल्टर
+    if atr_sma > 0 and not (0.45 <= (atr_15m / atr_sma) <= 3.0):
         return res
 
-    side, pattern = check_15m_patterns(df_15m, key_levels, atr_15m)
+    side, pattern = check_15m_patterns(df, swing_levels, atr_15m, ema20, trend_15m)
     if not side or vol_ratio < VOLUME_MULTIPLIER:
         return res
 
-    if (side == "BUY" and not (38 <= rsi_15m <= 70)) or (side == "SELL" and not (30 <= rsi_15m <= 62)):
+    if (side == "BUY" and not (35 <= rsi_15m <= 72)) or (side == "SELL" and not (28 <= rsi_15m <= 65)):
         return res
 
-    near_htf = any(abs(price - lvl) <= 1.2 * atr_15m for lvl in htf_levels)
-    if (side == "BUY" and trend_1h == "UP" and trend_4h != "DOWN") or (side == "SELL" and trend_1h == "DOWN" and trend_4h != "UP"):
-        res.update({"signal": side, "mode": "Mode A (Trend Pullback)", "pattern": pattern})
-    elif near_htf and pattern in ["Liquidity Sweep", "Pin Bar (Hammer)", "Pin Bar (Shooting Star)"]:
-        res.update({"signal": side, "mode": "Mode B (HTF Zone Reversal)", "pattern": pattern})
+    # 15M ट्रेंड के साथ सिग्नल (Mode A) या मज़बूत स्विंग ज़ोन रिवर्सल (Mode B)
+    if (side == "BUY" and trend_15m == "UP") or (side == "SELL" and trend_15m == "DOWN"):
+        res.update({"signal": side, "mode": "15M Trend Setup", "pattern": pattern})
+    elif pattern in ["15M Liquidity Sweep", "15M Pin Bar (Hammer)", "15M Pin Bar (Shooting Star)"]:
+        res.update({"signal": side, "mode": "15M Zone Reversal", "pattern": pattern})
 
     return res
 
 
-def evaluate_trade(analysis: dict, df_15m, funding_rate: float) -> dict:
+def evaluate_trade(analysis: dict, df_15m: pd.DataFrame, funding_rate: float) -> dict:
     side, entry, atr = analysis["signal"], analysis["price"], analysis["atr_15m"]
     last_c = df_15m.iloc[-1]
     min_sl_dist = entry * MIN_SL_PCT
 
     if side == "BUY":
-        raw_sl = min(float(last_c["low"]), analysis["recent_swing_low"]) - (0.3 * atr)
+        raw_sl = min(float(last_c["low"]), analysis["recent_swing_low"]) - (0.25 * atr)
         sl_dist = max(entry - raw_sl, min_sl_dist)
+        # बहुत बड़ा SL होने पर ATR से कैप करें ताकि R:R और Lot सही रहें
+        sl_dist = min(sl_dist, max(min_sl_dist, 2.2 * atr))
         sl, tp1, tp2 = round(entry - sl_dist, 1), round(entry + 2.0 * sl_dist, 1), round(entry + 3.5 * sl_dist, 1)
     else:
-        raw_sl = max(float(last_c["high"]), analysis["recent_swing_high"]) + (0.3 * atr)
+        raw_sl = max(float(last_c["high"]), analysis["recent_swing_high"]) + (0.25 * atr)
         sl_dist = max(raw_sl - entry, min_sl_dist)
+        sl_dist = min(sl_dist, max(min_sl_dist, 2.2 * atr))
         sl, tp1, tp2 = round(entry + sl_dist, 1), round(entry - 2.0 * sl_dist, 1), round(entry - 3.5 * sl_dist, 1)
 
     fee_usd = entry * ROUND_TRIP_FEE_PCT
@@ -354,16 +371,15 @@ def evaluate_trade(analysis: dict, df_15m, funding_rate: float) -> dict:
     if net_rr < MIN_NET_RR:
         return {"approved": False}
 
+    # नजदीकी 15M सपोर्ट/रेज़िस्टेंस की चेतावनी (ट्रेड ब्लॉक नहीं करेगा, सिर्फ़ अलर्ट देगा)
     obs_warn = None
-    for lvl in analysis["htf_levels"]:
-        if side == "BUY" and (entry + 0.2 * sl_dist) < lvl < tp1:
-            if (lvl - entry) < 1.5 * sl_dist:
-                return {"approved": False}
-            obs_warn = f"ध्यान दें: ${lvl:,.0f} पर HTF रेज़िस्टेंस है"
-        elif side == "SELL" and tp1 < lvl < (entry - 0.2 * sl_dist):
-            if (entry - lvl) < 1.5 * sl_dist:
-                return {"approved": False}
-            obs_warn = f"ध्यान दें: ${lvl:,.0f} पर HTF सपोर्ट है"
+    for lvl in analysis["swing_levels"]:
+        if side == "BUY" and (entry + 0.3 * sl_dist) < lvl < tp1:
+            obs_warn = f"ध्यान दें: ${lvl:,.0f} के पास 15M रेज़िस्टेंस है"
+            break
+        elif side == "SELL" and tp1 < lvl < (entry - 0.3 * sl_dist):
+            obs_warn = f"ध्यान दें: ${lvl:,.0f} के पास 15M सपोर्ट है"
+            break
 
     lots = max(1, int(((RISK_PER_TRADE_INR / USD_TO_INR) / (sl_dist + fee_usd)) / LOT_SIZE_BTC))
 
@@ -465,7 +481,7 @@ def get_chart_style():
     )
 
 
-def render_chart(df: pd.DataFrame, title: str, filename: str, hlines=None, colors=None, figsize=(10, 5.6), dpi=115) -> str:
+def render_chart(df: pd.DataFrame, title: str, filename: str, hlines=None, colors=None, figsize=(10, 5.6), dpi=115, show_ema=True) -> str:
     plot_df = df.copy()
     plot_df["datetime"] = plot_df["datetime"].dt.tz_convert(IST).dt.tz_localize(None)
     plot_df = plot_df.set_index("datetime")
@@ -480,6 +496,9 @@ def render_chart(df: pd.DataFrame, title: str, filename: str, hlines=None, color
     )
     if hlines:
         kwargs["hlines"] = dict(hlines=hlines, colors=colors, linestyle="--", linewidths=1.5)
+    if show_ema and len(plot_df) >= 20:
+        ema20_line = plot_df["close"].ewm(span=EMA_FAST_15M, adjust=False).mean()
+        kwargs["addplot"] = mpf.make_addplot(ema20_line, color="#FFD600", width=1.4)
 
     mpf.plot(plot_df, **kwargs)
     return filename
@@ -497,7 +516,6 @@ def load_font(size: int, bold: bool = True):
 
 
 def draw_anime_girl_avatar(size: int = 205, mouth_state: int = 0, blink: bool = False, accent=(56, 189, 248)) -> Image.Image:
-    """2x हाई-रेज़ोल्यूशन 2D एनीमे ट्रेडर गर्ल अवतार।"""
     S = size * 2
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
@@ -559,7 +577,6 @@ def draw_anime_girl_avatar(size: int = 205, mouth_state: int = 0, blink: bool = 
 
 
 def draw_youtube_badge(draw: ImageDraw.ImageDraw, W: int, y_top: int, handle: str, font):
-    """नीचे सेंटर में लाल YouTube लोगो + @Jaanibhai_9 क्रिएटर बैज।"""
     bbox = draw.textbbox((0, 0), handle, font=font)
     tw = bbox[2] - bbox[0]
     th = bbox[3] - bbox[1]
@@ -577,10 +594,8 @@ def draw_youtube_badge(draw: ImageDraw.ImageDraw, W: int, y_top: int, handle: st
     px2 = px1 + pill_w
     py2 = py1 + pill_h
 
-    # डार्क पिल कंटेनर
     draw.rounded_rectangle([(px1, py1), (px2, py2)], radius=pill_h // 2, fill=(22, 32, 56), outline=(255, 0, 0), width=2)
 
-    # लाल YouTube लोगो (Rounded Rectangle + सफ़ेद Play Triangle)
     lx1 = px1 + pad_x
     ly1 = py1 + (pill_h - logo_h) // 2
     lx2 = lx1 + logo_w
@@ -593,7 +608,6 @@ def draw_youtube_badge(draw: ImageDraw.ImageDraw, W: int, y_top: int, handle: st
     ]
     draw.polygon(tri, fill=(255, 255, 255))
 
-    # YouTube हैंडल टेक्स्ट
     tx = lx2 + gap
     ty = py1 + (pill_h - th) // 2 - 3
     draw.text((tx, ty), handle, font=font, fill=(255, 255, 255))
@@ -612,34 +626,29 @@ def build_reel_frame(chart_im: Image.Image, action: str, curr_price: float, anal
     f_yt = load_font(28, True)
 
     if action == "BUY":
-        badge_bg, badge_txt = (0, 180, 95), "SIGNAL: BUY NOW"
+        badge_bg, badge_txt = (0, 180, 95), "15M SIGNAL: BUY NOW"
     elif action == "SELL":
-        badge_bg, badge_txt = (225, 35, 65), "SIGNAL: SELL NOW"
+        badge_bg, badge_txt = (225, 35, 65), "15M SIGNAL: SELL NOW"
     else:
-        badge_bg, badge_txt = (230, 145, 10), "DECISION: WAIT"
+        badge_bg, badge_txt = (230, 145, 10), "15M DECISION: WAIT"
 
-    # टॉप हेडर
     draw.rectangle([(0, 0), (W, 125)], fill=(18, 28, 50))
-    draw.text((38, 24), "BTCUSD LIVE ANALYSIS", font=f_title, fill=(255, 255, 255))
+    draw.text((38, 24), "BTCUSD 15M LIVE ANALYSIS", font=f_title, fill=(255, 255, 255))
     now_str = datetime.datetime.now(IST).strftime("%d %b | %I:%M %p IST")
     draw.text((38, 78), f"Delta Exchange India  •  {now_str}", font=f_small, fill=(148, 163, 184))
 
-    # बड़ा BUY / SELL / WAIT बैज
     draw.rounded_rectangle([(38, 146), (W - 38, 232)], radius=20, fill=badge_bg)
     bbox = draw.textbbox((0, 0), badge_txt, font=f_badge)
     draw.text(((W - (bbox[2] - bbox[0])) // 2, 162), badge_txt, font=f_badge, fill=(255, 255, 255))
 
-    # बीच में एनिमेटेड 15M चार्ट
     cx = (W - chart_im.width) // 2
     cy = 256 + (505 - chart_im.height) // 2
     canvas.paste(chart_im, (cx, cy))
 
-    # प्रोग्रेस बार
     bar_w = int((W - 76) * min(1.0, max(0.05, step_pct)))
     draw.rounded_rectangle([(38, 782), (W - 38, 794)], radius=6, fill=(30, 41, 59))
     draw.rounded_rectangle([(38, 782), (38 + bar_w, 794)], radius=6, fill=badge_bg)
 
-    # नीचे का इन्फो कार्ड + दाईं तरफ़ 2D एनीमे गर्ल (साफ़ गैप के साथ)
     draw.rounded_rectangle([(38, 818), (W - 38, 1168)], radius=22, fill=(18, 28, 50), outline=(51, 65, 85), width=2)
 
     if trade:
@@ -653,8 +662,8 @@ def build_reel_frame(chart_im: Image.Image, action: str, curr_price: float, anal
     else:
         lines = [
             (f"LIVE: ${curr_price:,.1f}", (56, 189, 248)),
-            (f"1D: {analysis['trend_1d']} | 4H: {analysis['trend_4h']}", (248, 250, 252)),
-            (f"1H TREND: {analysis['trend_1h']}", (248, 250, 252)),
+            (f"15M TREND: {analysis['trend_15m']}", (248, 250, 252)),
+            (f"20-EMA: ${analysis['ema20']:,.0f}", (253, 224, 71)),
             (f"RSI: {analysis['rsi_15m']} | VOL: {analysis['vol_ratio']}x", (250, 204, 21)),
             (f"VWAP: ${analysis['vwap']:,.0f}", (251, 146, 60)),
         ]
@@ -667,7 +676,6 @@ def build_reel_frame(chart_im: Image.Image, action: str, curr_price: float, anal
     girl = draw_anime_girl_avatar(size=205, mouth_state=mouth_state, blink=blink, accent=badge_bg)
     canvas.paste(girl, (W - 258, 892), girl)
 
-    # फ़ुटर में लाल YouTube लोगो + @Jaanibhai_9
     draw_youtube_badge(draw, W, 1192, YOUTUBE_HANDLE, f_yt)
 
     return np.array(canvas)
@@ -699,7 +707,6 @@ def generate_female_hindi_voice(script: str, out_mp3: str) -> bool:
 
 
 def create_animated_reel_with_voice(df_15m: pd.DataFrame, curr_price: float, analysis: dict, trade=None, out_mp4="btc_reel.mp4") -> str:
-    """9:16 स्मूद 15-सेकंड कैंडल एनीमेशन + 2D एनीमे गर्ल + YouTube बैज + हिंदी महिला आवाज़।"""
     raw_mp4 = "raw_anim.mp4"
     voice_mp3 = "voice_hi.mp3"
     tmp_png = "anim_step.png"
@@ -712,7 +719,7 @@ def create_animated_reel_with_voice(df_15m: pd.DataFrame, curr_price: float, ana
         if trade:
             side_word = "खरीदने यानी बाय" if trade["side"] == "BUY" else "बेचने यानी सेल"
             script = (
-                f"नमस्ते ट्रेडर्स! बिटकॉइन में पक्का {side_word} का सिग्नल बना है। "
+                f"नमस्ते ट्रेडर्स! बिटकॉइन के 15 मिनट चार्ट पर पक्का {side_word} का सिग्नल बना है। "
                 f"अभी लाइव प्राइस {p_int} डॉलर है। "
                 f"एंट्री {int(trade['entry'])} डॉलर पर, स्टॉप लॉस {int(trade['sl'])} डॉलर, "
                 f"और पहला टारगेट {int(trade['tp1'])} डॉलर का है। "
@@ -720,10 +727,10 @@ def create_animated_reel_with_voice(df_15m: pd.DataFrame, curr_price: float, ana
                 f"ऐसे ही लाइव अपडेट्स के लिए यूट्यूब पर जानी भाई नाइन को सब्सक्राइब करें।"
             )
         else:
-            trend_word = "नीचे यानी डाउन" if analysis["trend_1h"] == "DOWN" else "ऊपर यानी अप"
+            trend_word = "नीचे यानी डाउन" if analysis["trend_15m"] == "DOWN" else "ऊपर यानी अप"
             script = (
                 f"नमस्ते ट्रेडर्स! बिटकॉइन अभी {p_int} डॉलर के पास चल रहा है। "
-                f"1 घंटे का ट्रेंड {trend_word} है, और 15 मिनट का आर एस आई {int(round(analysis['rsi_15m']))} है। "
+                f"15 मिनट के चार्ट पर ट्रेंड {trend_word} है, और आर एस आई {int(round(analysis['rsi_15m']))} है। "
                 f"अभी कोई पक्का सेटअप नहीं बना है, इसलिए फैसला है वेट। "
                 f"अभी न खरीदें, न बेचें, सही मौके का इंतज़ार करें। "
                 f"ऐसे ही लाइव अपडेट्स के लिए यूट्यूब पर जानी भाई नाइन को सब्सक्राइब करें।"
@@ -731,7 +738,6 @@ def create_animated_reel_with_voice(df_15m: pd.DataFrame, curr_price: float, ana
 
         has_audio = generate_female_hindi_voice(script, voice_mp3)
 
-        # 18 स्टेप्स × 3 फ्रेम @ 4 FPS = ~13.5 सेकंड तक स्मूद कैंडल एनीमेशन
         steps = list(range(14, len(full_df) + 1, 2))
         if steps[-1] != len(full_df):
             steps.append(len(full_df))
@@ -757,11 +763,10 @@ def create_animated_reel_with_voice(df_15m: pd.DataFrame, curr_price: float, ana
                     hlines = [float(sub_df["close"].iloc[-1])]
                     colors = ["#38BDF8"]
 
-                # ऊपर और नीचे एक ही लाइव प्राइस दिखाना
                 chart_title = f"BTCUSD 15M (IST)  •  LIVE: ${curr_price:,.1f}"
                 render_chart(
                     sub_df, chart_title,
-                    tmp_png, hlines=hlines, colors=colors, figsize=(7.0, 5.0), dpi=100
+                    tmp_png, hlines=hlines, colors=colors, figsize=(7.0, 5.0), dpi=100, show_ema=True
                 )
                 c_im = Image.open(tmp_png).convert("RGB")
                 c_im.thumbnail((680, 500), Image.Resampling.LANCZOS)
@@ -777,7 +782,6 @@ def create_animated_reel_with_voice(df_15m: pd.DataFrame, curr_price: float, ana
                     writer.append_data(fr_arr)
                     frame_idx += 1
 
-            # बची हुई आवाज़ कवर करने के लिए आखिरी क्लियर चार्ट + बोलती हुई 2D गर्ल
             for _ in range(80):
                 fr_arr = build_reel_frame(
                     last_chart_im, action, curr_price, analysis, trade=trade,
@@ -823,18 +827,17 @@ def create_animated_reel_with_voice(df_15m: pd.DataFrame, curr_price: float, ana
         return ""
 
 
-def send_manual_status(data: dict, curr_price: float, fr: float, analysis: dict, reason: str):
+def send_manual_status(df_15m: pd.DataFrame, curr_price: float, fr: float, analysis: dict, reason: str):
     opt_note = get_atm_options_note(curr_price)
-    ema_pos = "1H 20-EMA के ऊपर (UP)" if analysis["trend_1h"] == "UP" else "1H 20-EMA के नीचे (DOWN)"
     now_ist = datetime.datetime.now(IST).strftime("%d-%b %I:%M %p IST")
 
     caption = (
-        f"⏳ **फैसला: WAIT (अभी इंतज़ार करें — न खरीदें, न बेचें)**\n"
+        f"⏳ **15M फैसला: WAIT (अभी इंतज़ार करें — न खरीदें, न बेचें)**\n"
         f"🕒 समय: `{now_ist}`\n"
         f"💰 **लाइव प्राइस:** `${curr_price:,.1f}`\n"
-        f"📈 **ट्रेंड:** 1D `{analysis['trend_1d']}` | 4H `{analysis['trend_4h']}` | {ema_pos}\n"
+        f"📈 **15M ट्रेंड:** {analysis['trend_label']}\n"
         f"📊 **15M RSI:** `{analysis['rsi_15m']}` | **वॉल्यूम:** `{analysis['vol_ratio']}x`\n"
-        f"📌 **Weekly VWAP:** `${analysis['vwap']:,.1f}` | **Funding:** `{round(fr, 4)}%`\n"
+        f"📌 **20-EMA:** `${analysis['ema20']:,.1f}` | **Weekly VWAP:** `${analysis['vwap']:,.1f}` | **Funding:** `{round(fr, 4)}%`\n"
         f"🔍 **कारण:** {reason}\n\n"
         f"{opt_note}\n"
         f"▶️ **YouTube:** `{YOUTUBE_HANDLE}`"
@@ -847,21 +850,21 @@ def send_manual_status(data: dict, curr_price: float, fr: float, analysis: dict,
         colors.append("#FF9800")
 
     photo_file = render_chart(
-        data["15m"].tail(55), f"BTCUSD 15M (IST) | WAIT | LIVE: ${curr_price:,.1f} | RSI: {analysis['rsi_15m']}",
-        "status_chart.png", hlines=hlines, colors=colors
+        df_15m.tail(55), f"BTCUSD 15M (IST) | WAIT | LIVE: ${curr_price:,.1f} | RSI: {analysis['rsi_15m']}",
+        "status_chart.png", hlines=hlines, colors=colors, show_ema=True
     )
     msg_id = send_tg_photo(photo_file, caption)
 
-    vid_file = create_animated_reel_with_voice(data["15m"], curr_price, analysis, trade=None)
+    vid_file = create_animated_reel_with_voice(df_15m, curr_price, analysis, trade=None)
     send_tg_video(
         vid_file,
-        f"🎬 **Reels / Shorts वीडियो (हिंदी आवाज़ सहित)**\n⏳ फैसला: **WAIT (अभी इंतज़ार करें)**\n▶️ YouTube: `{YOUTUBE_HANDLE}`",
+        f"🎬 **15M Reels / Shorts वीडियो (हिंदी आवाज़ सहित)**\n⏳ फैसला: **WAIT (अभी इंतज़ार करें)**\n▶️ YouTube: `{YOUTUBE_HANDLE}`",
         reply_to=msg_id
     )
 
 
 # ==============================================================================
-# 7. मुख्य 24/7 One-Shot रनर (Cooldown = 0)
+# 7. मुख्य 24/7 15M One-Shot रनर (Cooldown = 0)
 # ==============================================================================
 def main():
     is_manual = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch"
@@ -890,7 +893,7 @@ def main():
 
         if (side == "BUY" and curr_price >= t["tp2"]) or (side == "SELL" and curr_price <= t["tp2"]):
             send_tg_message(
-                f"🏆 **TP2 हिट (${t['tp2']:,.1f}) — ट्रेड सफल!**\nबॉट तुरंत अगले नए सेटअप की तलाश में लग गया है।",
+                f"🏆 **TP2 हिट (${t['tp2']:,.1f}) — ट्रेड सफल!**\nबॉट तुरंत अगले नए 15M सेटअप की तलाश में लग गया है।",
                 reply_to=st["signal_msg_id"]
             )
             st.update({"state": "SCANNING", "trade": None, "signal_msg_id": None})
@@ -899,9 +902,9 @@ def main():
 
         if (side == "BUY" and curr_price <= t["sl"]) or (side == "SELL" and curr_price >= t["sl"]):
             if t.get("tp1_hit"):
-                msg = f"🛡️ **Breakeven SL हिट (${t['sl']:,.1f})** (TP1 पहले ही बुक हो चुका था)।\nबॉट तुरंत अगले नए सेटअप के लिए तैयार है।"
+                msg = f"🛡️ **Breakeven SL हिट (${t['sl']:,.1f})** (TP1 पहले ही बुक हो चुका था)।\nबॉट तुरंत अगले नए 15M सेटअप के लिए तैयार है।"
             else:
-                msg = f"🛑 **Stop Loss हिट (${t['sl']:,.1f})।**\nबॉट तुरंत अगले नए सेटअप के लिए तैयार है।"
+                msg = f"🛑 **Stop Loss हिट (${t['sl']:,.1f})।**\nबॉट तुरंत अगले नए 15M सेटअप के लिए तैयार है।"
             send_tg_message(msg, reply_to=st["signal_msg_id"])
             st.update({"state": "SCANNING", "trade": None, "signal_msg_id": None})
             save_state(st)
@@ -918,47 +921,41 @@ def main():
         return
 
     # --- अवस्था 2: नया 15M मार्केट स्कैन ---
-    data = {
-        "1d": fetch_candles("1d", 500),
-        "4h": fetch_candles("4h", 350),
-        "1h": fetch_candles("1h", 350),
-        "15m": fetch_candles("15m", 750)
-    }
-    if any(df.empty for df in data.values()):
-        print("Incomplete data.")
+    df_15m = fetch_candles("15m", 750)
+    if df_15m.empty:
+        print("15M data unavailable.")
         return
 
-    latest_ts = int(data["15m"]["time"].iloc[-1])
+    latest_ts = int(df_15m["time"].iloc[-1])
     if latest_ts <= st["last_candle_ts"]:
         if is_manual:
-            analysis = analyze_market(data)
-            send_manual_status(data, curr_price, fr, analysis, "अभी कोई पक्का सेटअप नहीं बना है (24/7 स्कैनिंग चालू है)।")
-        print("Same candle already scanned.")
+            analysis = analyze_market_15m(df_15m)
+            send_manual_status(df_15m, curr_price, fr, analysis, "अभी कोई पक्का 15M सेटअप नहीं बना है (24/7 स्कैनिंग चालू है)।")
+        print("Same 15M candle already scanned.")
         return
 
     st["last_candle_ts"] = latest_ts
-    analysis = analyze_market(data)
+    analysis = analyze_market_15m(df_15m)
 
     if analysis["signal"] == "WAIT":
         if is_manual:
-            send_manual_status(data, curr_price, fr, analysis, "अभी कोई पक्का सेटअप नहीं बना है (24/7 स्कैनिंग चालू है)।")
-        print("No setup found. Staying quiet.")
+            send_manual_status(df_15m, curr_price, fr, analysis, "अभी कोई पक्का 15M सेटअप नहीं बना है (24/7 स्कैनिंग चालू है)।")
+        print("No 15M setup found. Staying quiet.")
         save_state(st)
         return
 
-    trade = evaluate_trade(analysis, data["15m"], fr)
+    trade = evaluate_trade(analysis, df_15m, fr)
     if not trade["approved"]:
         if is_manual:
-            send_manual_status(data, curr_price, fr, analysis, "सेटअप बना था, लेकिन Risk/Reward या HTF सपोर्ट/रेज़िस्टेंस फ़िल्टर ने रोक दिया।")
-        print("Trade rejected by Risk/Obstacle filter.")
+            send_manual_status(df_15m, curr_price, fr, analysis, "15M सेटअप बना था, लेकिन Net Risk/Reward 1:1.5 से कम था।")
+        print("Trade rejected by Net R:R filter.")
         save_state(st)
         return
 
-    # --- पक्का BUY या SELL सिग्नल ---
+    # --- पक्का 15M BUY या SELL सिग्नल ---
     opt_note = get_atm_options_note(trade["entry"])
     mode_tag = "📝 [PAPER]" if PAPER_MODE else "🚨 [LIVE]"
-    ema_pos = "1H 20-EMA के ऊपर" if analysis["trend_1h"] == "UP" else "1H 20-EMA के नीचे"
-    action_header = "🟢 **फैसला: BUY (खरीदें) — BTCUSD**" if trade["side"] == "BUY" else "🔴 **फैसला: SELL (बेचें) — BTCUSD**"
+    action_header = "🟢 **15M फैसला: BUY (खरीदें) — BTCUSD**" if trade["side"] == "BUY" else "🔴 **15M फैसला: SELL (बेचें) — BTCUSD**"
 
     warn_text = f"\n⚠️ {trade['obstacle_warning']}" if trade["obstacle_warning"] else ""
     if trade["funding_warn"]:
@@ -967,14 +964,14 @@ def main():
     caption = (
         f"{mode_tag} {action_header}\n"
         f"• **सेटअप:** {trade['mode']} | {trade['pattern']}\n"
-        f"• **पुष्टि:** वॉल्यूम `{analysis['vol_ratio']}x` | 15M RSI `{analysis['rsi_15m']}` | {ema_pos}\n\n"
+        f"• **पुष्टि:** वॉल्यूम `{analysis['vol_ratio']}x` | 15M RSI `{analysis['rsi_15m']}` | {analysis['trend_label']}\n\n"
         f"🎯 **Entry:** `${trade['entry']:,.1f}`\n"
         f"🛑 **Stop Loss:** `${trade['sl']:,.1f}`\n"
         f"✅ **Target 1:** `${trade['tp1']:,.1f}` *(TP1 पर SL ऑटो Entry पर शिफ़्ट)*\n"
         f"🏆 **Target 2:** `${trade['tp2']:,.1f}`\n\n"
         f"⚖️ **Net R:R (फ़ीस+GST बाद):** `1:{trade['net_rr']}`\n"
         f"📦 **सुझावित Lot Size:** `{trade['lots']} Lots` *(रिस्क: ₹{int(trade['risk_inr'])})*\n"
-        f"📌 **Weekly VWAP:** `${analysis['vwap']:,.1f}` | **Funding:** `{trade['funding_rate_pct']}%`"
+        f"📌 **15M 20-EMA:** `${analysis['ema20']:,.1f}` | **Weekly VWAP:** `${analysis['vwap']:,.1f}` | **Funding:** `{trade['funding_rate_pct']}%`"
         f"{warn_text}\n\n{opt_note}\n"
         f"▶️ **YouTube:** `{YOUTUBE_HANDLE}`"
     )
@@ -986,21 +983,21 @@ def main():
         colors.append("#FF9800")
 
     photo_file = render_chart(
-        data["15m"].tail(55), f"BTCUSD 15M (IST) | {trade['side']} ({trade['pattern']})",
-        "signal_chart.png", hlines=hlines, colors=colors
+        df_15m.tail(55), f"BTCUSD 15M (IST) | {trade['side']} ({trade['pattern']})",
+        "signal_chart.png", hlines=hlines, colors=colors, show_ema=True
     )
     msg_id = send_tg_photo(photo_file, caption)
 
-    vid_file = create_animated_reel_with_voice(data["15m"], trade["entry"], analysis, trade=trade)
+    vid_file = create_animated_reel_with_voice(df_15m, trade["entry"], analysis, trade=trade)
     send_tg_video(
         vid_file,
-        f"🎬 **Reels / Shorts वीडियो (हिंदी आवाज़ सहित)**\n{action_header}\n▶️ YouTube: `{YOUTUBE_HANDLE}`",
+        f"🎬 **15M Reels / Shorts वीडियो (हिंदी आवाज़ सहित)**\n{action_header}\n▶️ YouTube: `{YOUTUBE_HANDLE}`",
         reply_to=msg_id
     )
 
     st.update({"state": "ACTIVE_TRADE", "trade": trade, "signal_msg_id": msg_id})
     save_state(st)
-    print("Signal photo + Reels/Shorts Hindi voice video sent!")
+    print("15M Signal photo + Reels/Shorts Hindi voice video sent!")
 
 
 if __name__ == "__main__":
