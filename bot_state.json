@@ -1,22 +1,6 @@
 {
-  "state": "ACTIVE_TRADE",
-  "trade": {
-    "approved": true,
-    "side": "SELL",
-    "mode": "15M Trend Setup",
-    "pattern": "15M Pin Bar (Shooting Star)",
-    "entry": 59430.0,
-    "sl": 59899.0,
-    "tp1": 58491.9,
-    "tp2": 57788.4,
-    "net_rr": 1.61,
-    "lots": 10,
-    "risk_inr": 500.0,
-    "obstacle_warning": null,
-    "funding_rate_pct": 0.007,
-    "funding_warn": "",
-    "tp1_hit": false
-  },
-  "signal_msg_id": 35,
+  "state": "SCANNING",
+  "trade": null,
+  "signal_msg_id": null,
   "last_candle_ts": 1795320000
 }
