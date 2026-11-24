@@ -1,6 +1,22 @@
 {
-  "state": "SCANNING",
-  "trade": null,
-  "signal_msg_id": null,
-  "last_candle_ts": 1795477500
+  "state": "ACTIVE_TRADE",
+  "trade": {
+    "approved": true,
+    "side": "BUY",
+    "mode": "15M Trend Setup",
+    "pattern": "15M Liquidity Sweep",
+    "entry": 61517.5,
+    "sl": 60980.7,
+    "tp1": 62591.1,
+    "tp2": 63396.3,
+    "net_rr": 1.64,
+    "lots": 9,
+    "risk_inr": 500.0,
+    "obstacle_warning": "\u0927\u094d\u092f\u093e\u0928 \u0926\u0947\u0902: $61,747 \u0915\u0947 \u092a\u093e\u0938 15M \u0930\u0947\u091c\u093c\u093f\u0938\u094d\u091f\u0947\u0902\u0938 \u0939\u0948",
+    "funding_rate_pct": 0.0033,
+    "funding_warn": "",
+    "tp1_hit": false
+  },
+  "signal_msg_id": 70,
+  "last_candle_ts": 1795482000
 }
