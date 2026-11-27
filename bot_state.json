@@ -6,7 +6,7 @@
     "mode": "15M Trend Setup",
     "pattern": "15M Liquidity Sweep",
     "entry": 59225.0,
-    "sl": 58082.3,
+    "sl": 59225.0,
     "tp1": 61510.3,
     "tp2": 63224.3,
     "net_rr": 1.83,
@@ -15,7 +15,7 @@
     "obstacle_warning": null,
     "funding_rate_pct": 0.0073,
     "funding_warn": "",
-    "tp1_hit": false
+    "tp1_hit": true
   },
   "signal_msg_id": 107,
   "last_candle_ts": 1795626000
